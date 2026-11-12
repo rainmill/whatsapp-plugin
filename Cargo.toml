@@ -1,0 +1,39 @@
+[package]
+name = "rainmill-whatsapp"
+version = "0.1.0"
+description = "WhatsApp Business messaging for Laterite: message templates mirrored from Meta and previewed in the admin, template messages sent through the queue, and every message logged with its delivery state"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rainmill/whatsapp-plugin"
+publish = false
+
+# Marks this crate as a Laterite plugin and names the module it registers, so a
+# tool can tell what it is without building it. Which Laterite it supports is
+# stated by the dependency requirement below, never repeated here.
+[package.metadata.laterite]
+plugin = "rainmill.whatsapp"
+
+[dependencies]
+# Laterite crates are version-only so this manifest is location-independent
+# (identical whether dev-symlinked under an app's plugins/ tree or vendored).
+laterite-core = "0.11"
+# The Templates and Messages screens, the charts and the audit log.
+laterite-admin = "0.11"
+# Holds the access token and counts each message against its category.
+rainmill-vault = "0.1"
+# Calls the Graph API.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Text timestamps.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror = "1"
+# The signature on a delivery report.
+hmac = "0.12"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+laterite-core = { version = "0.11", features = ["sqlite", "postgres", "testing"] }
+laterite-auth = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
