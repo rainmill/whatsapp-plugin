@@ -427,6 +427,210 @@ pub async fn sync(db: &Db, crypt: &Crypt) -> Result<usize, WhatsAppError> {
     Ok(count)
 }
 
+/// A template being written, before Meta has seen it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Draft {
+    /// Lowercase letters, digits and underscores.
+    pub name: String,
+    /// MARKETING, UTILITY or AUTHENTICATION.
+    pub category: String,
+    /// The language code, such as `en` or `en_US`.
+    pub language: String,
+    /// A line above the body, without values.
+    pub header: String,
+    /// The message, with `{{1}}`, `{{2}}` where values go.
+    pub body: String,
+    /// A sample for each value in the body, in order.
+    pub samples: Vec<String>,
+    /// A line under the body.
+    pub footer: String,
+    /// A button's label; with no `button_url` it is a quick reply.
+    pub button_text: String,
+    /// Where a URL button goes.
+    pub button_url: String,
+}
+
+impl Draft {
+    /// The draft as the template it would become, to preview it.
+    pub fn as_template(&self) -> Template {
+        Template {
+            id: 0,
+            wa_id: String::new(),
+            name: self.name.clone(),
+            language: self.language.clone(),
+            category: self.category.to_ascii_uppercase(),
+            status: "DRAFT".to_string(),
+            rejected_reason: None,
+            components: self.components(),
+            synced_at: String::new(),
+        }
+    }
+
+    fn components(&self) -> Value {
+        let mut components = Vec::new();
+        if !self.header.trim().is_empty() {
+            components.push(serde_json::json!({
+                "type": "HEADER", "format": "TEXT", "text": self.header.trim(),
+            }));
+        }
+        let mut body = serde_json::json!({ "type": "BODY", "text": self.body.trim() });
+        if !self.samples.is_empty() {
+            body["example"] = serde_json::json!({ "body_text": [self.samples] });
+        }
+        components.push(body);
+        if !self.footer.trim().is_empty() {
+            components.push(serde_json::json!({ "type": "FOOTER", "text": self.footer.trim() }));
+        }
+        if !self.button_text.trim().is_empty() {
+            let button = if self.button_url.trim().is_empty() {
+                serde_json::json!({ "type": "QUICK_REPLY", "text": self.button_text.trim() })
+            } else {
+                serde_json::json!({
+                    "type": "URL", "text": self.button_text.trim(), "url": self.button_url.trim(),
+                })
+            };
+            components.push(serde_json::json!({ "type": "BUTTONS", "buttons": [button] }));
+        }
+        Value::Array(components)
+    }
+
+    /// What is wrong with the draft, by field; empty when Meta's stated rules
+    /// are met.
+    pub fn problems(&self) -> Vec<(&'static str, String)> {
+        let mut problems = Vec::new();
+        let mut add = |field: &'static str, what: &str| problems.push((field, what.to_string()));
+        let name = self.name.trim();
+        if name.is_empty()
+            || name.len() > 512
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            add("name", "Use lowercase letters, digits and underscores.");
+        }
+        if !["MARKETING", "UTILITY", "AUTHENTICATION"]
+            .contains(&self.category.to_ascii_uppercase().as_str())
+        {
+            add("category", "Choose a category.");
+        }
+        if self.language.trim().is_empty() {
+            add("language", "Give the language code, such as en.");
+        }
+        if self.header.chars().count() > 60 {
+            add("header", "A header is at most 60 characters.");
+        }
+        if self.header.contains("{{") {
+            add("header", "Write the header without values.");
+        }
+        let body = self.body.trim();
+        if body.is_empty() || body.chars().count() > 1024 {
+            add("body", "Write the message, in at most 1024 characters.");
+        }
+        let takes = self.as_template().body_params();
+        let named = body.matches("{{").count();
+        if named != takes {
+            add(
+                "body",
+                "Number the values in order: {{1}}, {{2}}, with none skipped or repeated.",
+            );
+        }
+        if takes != self.samples.iter().filter(|s| !s.trim().is_empty()).count()
+            || takes != self.samples.len()
+        {
+            add(
+                "samples",
+                "Give one sample for each value in the message, one a line.",
+            );
+        }
+        if self.footer.chars().count() > 60 {
+            add("footer", "A footer is at most 60 characters.");
+        }
+        if self.button_text.chars().count() > 25 {
+            add("button_text", "A button's label is at most 25 characters.");
+        }
+        let url = self.button_url.trim();
+        if !url.is_empty()
+            && (self.button_text.trim().is_empty()
+                || !url.starts_with("https://")
+                || url.contains("{{"))
+        {
+            add(
+                "button_url",
+                "Give the button a label and an https address without values.",
+            );
+        }
+        problems
+    }
+}
+
+/// Submits a draft to Meta for review and mirrors it as Meta answers. The
+/// draft must have no [`problems`](Draft::problems).
+pub async fn submit(db: &Db, crypt: &Crypt, draft: &Draft) -> Result<(), WhatsAppError> {
+    if let Some((_, problem)) = draft.problems().into_iter().next() {
+        return Err(WhatsAppError::Refused(problem));
+    }
+    let account = Account::lease(db, crypt).await?;
+    let request = serde_json::json!({
+        "name": draft.name.trim(),
+        "language": draft.language.trim(),
+        "category": draft.category.to_ascii_uppercase(),
+        "components": draft.components(),
+    });
+    let path = format!("{}/message_templates", account.business_account_id);
+    match account.call(Method::Post, &path, Some(request)).await {
+        Ok(answer) => {
+            let text = |key: &str, otherwise: &str| {
+                answer
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(otherwise)
+                    .to_string()
+            };
+            let mirrored = serde_json::json!({
+                "id": text("id", ""),
+                "name": draft.name.trim(),
+                "language": draft.language.trim(),
+                "category": text("category", &draft.category),
+                "status": text("status", "PENDING"),
+                "components": draft.components(),
+            });
+            store(db, &mirrored, &now()).await?;
+            account.used().await;
+            Ok(())
+        }
+        Err(e) => {
+            account.failed(&e).await;
+            Err(e.into())
+        }
+    }
+}
+
+/// Deletes a template at Meta, in the one language of this row, and drops it
+/// from the mirror.
+pub async fn delete(db: &Db, crypt: &Crypt, template: &Template) -> Result<(), WhatsAppError> {
+    let account = Account::lease(db, crypt).await?;
+    let path = format!(
+        "{}/message_templates?hsm_id={}&name={}",
+        account.business_account_id, template.wa_id, template.name
+    );
+    if let Err(e) = account.call(Method::Delete, &path, None).await {
+        account.failed(&e).await;
+        return Err(e.into());
+    }
+    let (sql, values) = build(
+        db.backend,
+        Query::delete()
+            .from_table(Templates::Table)
+            .and_where(Expr::col(Templates::Id).eq(template.id))
+            .to_owned(),
+    );
+    bind_values(sqlx::query(&sql), values)
+        .execute(&db.pool)
+        .await?;
+    account.used().await;
+    Ok(())
+}
+
 /// Sends a request built by the account: used by [`sync`] and the screens.
 impl Account {
     pub(crate) async fn call(
@@ -471,6 +675,45 @@ mod tests {
             ]),
             synced_at: String::new(),
         }
+    }
+
+    #[test]
+    fn a_draft_names_what_meta_would_refuse() {
+        let good = Draft {
+            name: "order_ready".into(),
+            category: "utility".into(),
+            language: "en".into(),
+            body: "Hi {{1}}, order {{2}} is ready.".into(),
+            samples: vec!["Asha".into(), "A-100".into()],
+            button_text: "Track".into(),
+            button_url: "https://acme.test/orders".into(),
+            ..Draft::default()
+        };
+        assert!(good.problems().is_empty(), "{:?}", good.problems());
+        assert_eq!(
+            good.as_template().preview(&[], None).body,
+            "Hi Asha, order A-100 is ready."
+        );
+        let fields = |draft: &Draft| -> Vec<&'static str> {
+            draft
+                .problems()
+                .into_iter()
+                .map(|(field, _)| field)
+                .collect()
+        };
+        let bad = Draft {
+            name: "Order Ready".into(),
+            body: "Hi {{1}} and {{3}}".into(),
+            samples: vec!["Asha".into()],
+            button_url: "http://acme.test".into(),
+            ..good.clone()
+        };
+        assert_eq!(fields(&bad), vec!["name", "body", "button_url"]);
+        let unsampled = Draft {
+            samples: vec!["Asha".into()],
+            ..good
+        };
+        assert_eq!(fields(&unsampled), vec!["samples"]);
     }
 
     #[test]

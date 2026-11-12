@@ -9,4 +9,4 @@ bump is breaking and a patch is additive.
 
 ### Added
 
-- First cut. WhatsApp Business messaging for Laterite over Meta's Cloud API: the account's message templates mirrored and previewed in the admin, template messages sent through the queue with retries, a signed webhook that records sent, delivered, read and failed, and a Messages screen with figures and charts by outcome, category and template.
+- First cut. WhatsApp Business messaging for Laterite over Meta's Cloud API: the account's message templates mirrored and previewed in the admin, template messages sent through the queue with retries, templates written, previewed and submitted for review from the admin, a signed webhook that records sent, delivered, read and failed, and a Messages screen with figures and charts by outcome, category and template.

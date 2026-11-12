@@ -37,6 +37,10 @@ Under Settings, Credentials, add a **WhatsApp Cloud API** credential and switch 
 
 In the Meta app, under WhatsApp, Configuration, set the callback URL to `https://<your site>/webhooks/whatsapp` and the verify token to the phrase stored above, then subscribe to `messages` and `message_template_status_update`.
 
+## Write a template
+
+Templates, New template: a name, a category, the message with `{{1}}`, `{{2}}` where values go, and a sample of each value. Preview shows the message as a recipient reads it; Submit to Meta for review sends it, and the list shows it in review until Meta decides. Delete at Meta removes one language of a template.
+
 ## Send a message
 
 ```rust
@@ -73,7 +77,7 @@ A message stays queued and is tried five times over fifteen minutes when Meta is
 
 | Permission | Grants |
 | --- | --- |
-| `rainmill.whatsapp.templates` | The Templates screen and Sync now |
+| `rainmill.whatsapp.templates` | The Templates screen: Sync now, New template, Delete at Meta |
 | `rainmill.whatsapp.messages` | The Messages screen |
 
 ## License

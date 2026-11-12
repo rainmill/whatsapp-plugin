@@ -9,7 +9,7 @@ use laterite_admin::axum::extract::{Path, Query};
 use laterite_admin::axum::http::StatusCode;
 use laterite_admin::axum::response::{IntoResponse, Redirect, Response};
 use laterite_admin::axum::routing::{get, post};
-use laterite_admin::axum::{Extension, Router};
+use laterite_admin::axum::{Extension, Form, Router};
 use laterite_admin::chart::{
     stats, Chart, ChartQuery, Format, Kind, Period, Series, Stat, CHART_ASSETS,
 };
@@ -22,7 +22,7 @@ use laterite_admin::{
 use laterite_core::{t, Registry, Text};
 
 use crate::messages::{self, Sent};
-use crate::templates::{self, Template};
+use crate::templates::{self, Draft, Template};
 use crate::{WhatsAppError, MESSAGES, TEMPLATES};
 
 const SECTION: &str = "rainmill.whatsapp";
@@ -120,7 +120,35 @@ struct Templates;
 impl Screen for Templates {
     fn mount(&self, ctx: &RouteCtx) -> Router {
         let (index_cx, sync_cx, show_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
+        let (new_cx, write_cx, delete_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
         Router::new()
+            .route(
+                "/new",
+                get(move |Extension(shell): Extension<Shell>| {
+                    let ctx = new_cx.clone();
+                    async move { draft_page(&ctx, shell, &Draft::default(), false, None) }
+                })
+                .post(
+                    move |Extension(shell): Extension<Shell>,
+                          Extension(user): Extension<AuthenticatedUser>,
+                          Extension(session): Extension<SessionHandle>,
+                          Form(data): Form<HashMap<String, String>>| {
+                        let ctx = write_cx.clone();
+                        async move { write(&ctx, shell, user, session, data).await }
+                    },
+                ),
+            )
+            .route(
+                "/{id}/delete",
+                post(
+                    move |Path(id): Path<i64>,
+                          Extension(user): Extension<AuthenticatedUser>,
+                          Extension(session): Extension<SessionHandle>| {
+                        let ctx = delete_cx.clone();
+                        async move { delete(&ctx, user, session, id).await }
+                    },
+                ),
+            )
             .route(
                 "/",
                 get(move |Extension(shell): Extension<Shell>| {
@@ -193,10 +221,14 @@ async fn index(ctx: &RouteCtx, shell: Shell) -> Response {
             escape(&shell.t("Last read from Meta")),
         ));
     }
-    let actions = Button::post(t!("Sync now"), ctx.url("sync"))
+    let mut actions = Button::link(t!("New template"), ctx.url("new"))
         .primary()
-        .icon("refresh-cw")
         .render(&shell);
+    actions.push(
+        Button::post(t!("Sync now"), ctx.url("sync"))
+            .icon("refresh-cw")
+            .render(&shell),
+    );
     shell.page_with(
         PageHead::new(t!("Message templates")).actions(actions),
         Markup::raw_unchecked(body),
@@ -315,9 +347,16 @@ async fn show(ctx: &RouteCtx, shell: Shell, id: i64) -> Response {
             ))
             .unwrap_or_default(),
     );
+    let remove = Button::post(t!("Delete at Meta"), ctx.url(&format!("{id}/delete")))
+        .danger()
+        .confirm(t!(
+            "Delete this template at Meta? Its name cannot be used again for 30 days."
+        ))
+        .render(&shell);
     shell.page_with(
         PageHead::new(Text::dynamic(template.name.clone()))
             .back(t!("Message templates"), ctx.url(""))
+            .actions(remove)
             .assets(CHART_ASSETS),
         Markup::raw_unchecked(body),
     )
@@ -562,4 +601,247 @@ async fn log(ctx: &RouteCtx, shell: Shell, query: ChartQuery, state: Option<Stri
         PageHead::new(t!("WhatsApp messages")).assets(CHART_ASSETS),
         Markup::raw_unchecked(body),
     )
+}
+
+/// Reads the New template form.
+fn draft_from(data: &HashMap<String, String>) -> Draft {
+    let text = |key: &str| {
+        data.get(key)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    Draft {
+        name: text("name"),
+        category: text("category"),
+        language: text("language"),
+        header: text("header"),
+        body: data
+            .get("body")
+            .cloned()
+            .unwrap_or_default()
+            .replace("\r\n", "\n"),
+        samples: text("samples")
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        footer: text("footer"),
+        button_text: text("button_text"),
+        button_url: text("button_url"),
+    }
+}
+
+/// The New template form. Once a draft has been previewed with nothing wrong,
+/// the page shows it as a recipient would read it and offers to submit it.
+fn draft_page(
+    ctx: &RouteCtx,
+    shell: Shell,
+    draft: &Draft,
+    previewed: bool,
+    error: Option<String>,
+) -> Response {
+    let problems = if previewed {
+        draft.problems()
+    } else {
+        Vec::new()
+    };
+    let field = |name: &'static str, label: &str, control: String, help: &str| {
+        let wrong: String = problems
+            .iter()
+            .filter(|(field, _)| *field == name)
+            .map(|(_, what)| {
+                format!(
+                    r#"<p class="lat-field__error">{}</p>"#,
+                    escape(&shell.t(what))
+                )
+            })
+            .collect();
+        let help = if help.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<p class="lat-field__help">{}</p>"#,
+                escape(&shell.t(help))
+            )
+        };
+        format!(
+            r#"<div class="lat-field"><label class="lat-label" for="{name}">{}</label>{control}{help}{wrong}</div>"#,
+            escape(&shell.t(label))
+        )
+    };
+    let input = |name: &str, value: &str, extra: &str| {
+        format!(
+            r#"<input class="lat-input" id="{name}" name="{name}" value="{}" {extra}>"#,
+            escape(value)
+        )
+    };
+    let area = |name: &str, value: &str, rows: u8| {
+        format!(
+            r#"<textarea class="lat-input" id="{name}" name="{name}" rows="{rows}">{}</textarea>"#,
+            escape(value)
+        )
+    };
+    let options: String = [
+        ("UTILITY", "Utility: about something the person did"),
+        ("MARKETING", "Marketing: offers and announcements"),
+        ("AUTHENTICATION", "Authentication: one-time codes"),
+    ]
+    .iter()
+    .map(|(value, label)| {
+        format!(
+            r#"<option value="{value}"{}>{}</option>"#,
+            if draft.category.eq_ignore_ascii_case(value) {
+                " selected"
+            } else {
+                ""
+            },
+            escape(&shell.t(label))
+        )
+    })
+    .collect();
+    let ready = previewed && problems.is_empty();
+    let mut body = String::new();
+    if let Some(error) = error {
+        body.push_str(&format!(
+            r#"<div class="lat-alert">{}</div>"#,
+            escape(&error)
+        ));
+    }
+    body.push_str(&format!(
+        r#"<form class="lat-card" method="post" action="{action}"><input type="hidden" name="_csrf" value="{csrf}"><div class="lat-fields">{name}{category}{language}{header}{text}{samples}{footer}{button_text}{button_url}</div><div class="lat-form-actions" style="display:flex;gap:8px"><button class="lat-btn{quiet}" type="submit" name="step" value="preview">{preview}</button>{submit}</div></form>"#,
+        action = escape(&ctx.url("new")),
+        csrf = escape(shell.csrf_token()),
+        name = field(
+            "name",
+            "Name",
+            input("name", &draft.name, r#"maxlength="512" autocapitalize="off" spellcheck="false""#),
+            "Lowercase letters, digits and underscores. It cannot be changed, and a deleted name is held for 30 days."
+        ),
+        category = field(
+            "category",
+            "Category",
+            format!(r#"<select class="lat-input" id="category" name="category">{options}</select>"#),
+            "Meta charges by category and may move a template it thinks is in the wrong one."
+        ),
+        language = field(
+            "language",
+            "Language",
+            input(
+                "language",
+                if draft.language.is_empty() { "en" } else { &draft.language },
+                r#"maxlength="12""#
+            ),
+            ""
+        ),
+        header = field("header", "Header", input("header", &draft.header, r#"maxlength="60""#), "Optional. One line above the message."),
+        text = field(
+            "body",
+            "Message",
+            area("body", &draft.body, 6),
+            "Write {{1}}, {{2}} where a value goes. Anything that varies (a name, a date, a city) is a value, never typed in."
+        ),
+        samples = field(
+            "samples",
+            "Sample values",
+            area("samples", &draft.samples.join("\n"), 3),
+            "One a line, in order: a realistic example of each value. Meta reviews the message with these."
+        ),
+        footer = field("footer", "Footer", input("footer", &draft.footer, r#"maxlength="60""#), "Optional. One line under the message."),
+        button_text = field("button_text", "Button label", input("button_text", &draft.button_text, r#"maxlength="25""#), "Optional. With no address below it is a quick reply."),
+        button_url = field("button_url", "Button address", input("button_url", &draft.button_url, r#"inputmode="url""#), "Optional. An https address the button opens."),
+        quiet = if ready { "" } else { " lat-btn--primary" },
+        preview = escape(&shell.t("Preview")),
+        submit = if ready {
+            format!(
+                r#"<button class="lat-btn lat-btn--primary" type="submit" name="step" value="submit">{}</button>"#,
+                escape(&shell.t("Submit to Meta for review"))
+            )
+        } else {
+            String::new()
+        },
+    ));
+    if ready {
+        body.push_str(&format!(
+            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2><p class="lat-note">{}</p>{}</div>"#,
+            escape(&shell.t("Sample")),
+            escape(&shell.t(
+                "This is what Meta will review, filled with your sample values. Change anything above and preview again, or submit it."
+            )),
+            bubble(&draft.as_template().preview(&[], None)),
+        ));
+    }
+    shell.page_with(
+        PageHead::new(t!("New template")).back(t!("Message templates"), ctx.url("")),
+        Markup::raw_unchecked(body),
+    )
+}
+
+/// A preview of the form as posted, or its submission to Meta.
+async fn write(
+    ctx: &RouteCtx,
+    shell: Shell,
+    user: AuthenticatedUser,
+    session: SessionHandle,
+    data: HashMap<String, String>,
+) -> Response {
+    let draft = draft_from(&data);
+    let submit = data.get("step").is_some_and(|step| step == "submit");
+    if !submit || !draft.problems().is_empty() {
+        return draft_page(ctx, shell, &draft, true, None);
+    }
+    match templates::submit(ctx.db(), ctx.crypt(), &draft).await {
+        Ok(()) => {
+            ctx.audit(
+                &user,
+                "rainmill.whatsapp.template.submit",
+                Some("whatsapp_templates"),
+                None,
+                Some(&draft.name),
+                Some(&draft.category),
+            )
+            .await;
+            session.push_flash(
+                FlashLevel::Success,
+                t!("The template was sent to Meta for review."),
+            );
+            Redirect::to(&ctx.url("")).into_response()
+        }
+        // Meta's own words, on the form with everything typed kept.
+        Err(e) => draft_page(ctx, shell, &draft, true, Some(e.to_string())),
+    }
+}
+
+async fn delete(
+    ctx: &RouteCtx,
+    user: AuthenticatedUser,
+    session: SessionHandle,
+    id: i64,
+) -> Response {
+    let template = match templates::find(ctx.db(), id).await {
+        Ok(Some(template)) => template,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return failure(e),
+    };
+    match templates::delete(ctx.db(), ctx.crypt(), &template).await {
+        Ok(()) => {
+            ctx.audit(
+                &user,
+                "rainmill.whatsapp.template.delete",
+                Some("whatsapp_templates"),
+                Some(&id.to_string()),
+                Some(&template.name),
+                Some(&template.language),
+            )
+            .await;
+            session.push_flash(FlashLevel::Success, t!("The template was deleted."));
+            Redirect::to(&ctx.url("")).into_response()
+        }
+        Err(e) => {
+            session.push_flash(
+                FlashLevel::Error,
+                Text::dynamic(format!("The template could not be deleted: {e}")),
+            );
+            Redirect::to(&ctx.url(&id.to_string())).into_response()
+        }
+    }
 }

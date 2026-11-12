@@ -23,7 +23,7 @@ use rainmill_vault::{KindReg, Lease, SlotReg, VaultError};
 
 pub use graph::{use_graph, Graph, GraphError};
 pub use messages::{send, Message, MessageFailed};
-pub use templates::{Preview, Template};
+pub use templates::{Draft, Preview, Template};
 
 /// The kind of credential the plugin reads from the vault.
 pub const KIND: &str = "rainmill.whatsapp.cloud";

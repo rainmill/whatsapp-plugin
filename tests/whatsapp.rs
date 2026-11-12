@@ -29,6 +29,12 @@ struct FakeMeta {
 impl Graph for FakeMeta {
     async fn call(&self, request: Request) -> Result<Value, GraphError> {
         self.asked.lock().unwrap().push(request.clone());
+        if request.path.contains("message_templates") && request.method == Method::Post {
+            return Ok(json!({ "id": "13", "status": "PENDING", "category": "UTILITY" }));
+        }
+        if request.path.contains("message_templates") && request.method == Method::Delete {
+            return Ok(json!({ "success": true }));
+        }
         if request.path.contains("message_templates") {
             return Ok(json!({ "data": [
                 { "id": "11", "name": "order_ready", "language": "en", "status": "APPROVED", "category": "UTILITY",
@@ -275,6 +281,56 @@ async fn templates_are_mirrored_and_a_message_is_sent_and_followed() {
     assert_eq!(
         (sale.status.as_str(), sale.rejected_reason.as_deref()),
         ("REJECTED", Some("PROMOTIONAL"))
+    );
+
+    // A draft goes to Meta as components and is mirrored in review; a
+    // deleted template leaves the mirror.
+    let draft = templates::Draft {
+        name: "table_ready".into(),
+        category: "utility".into(),
+        language: "en".into(),
+        body: "Hi {{1}}, your table is ready.".into(),
+        samples: vec!["Asha".into()],
+        footer: "Acme".into(),
+        ..templates::Draft::default()
+    };
+    templates::submit(&db, &crypt, &draft).await.unwrap();
+    {
+        let asked = meta.asked.lock().unwrap();
+        let last = asked.last().unwrap();
+        assert_eq!(
+            (last.method, last.path.as_str()),
+            (Method::Post, "777/message_templates")
+        );
+        let body = last.body.as_ref().unwrap();
+        assert_eq!(body["category"], "UTILITY");
+        assert_eq!(body["components"][0]["example"]["body_text"][0][0], "Asha");
+        assert_eq!(body["components"][1]["type"], "FOOTER");
+    }
+    let mirrored = templates::named(&db, "table_ready", "en")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (mirrored.status.as_str(), mirrored.wa_id.as_str()),
+        ("PENDING", "13")
+    );
+    let bad = templates::Draft {
+        name: "Table Ready".into(),
+        ..draft
+    };
+    assert!(matches!(
+        templates::submit(&db, &crypt, &bad).await,
+        Err(WhatsAppError::Refused(_))
+    ));
+    templates::delete(&db, &crypt, &mirrored).await.unwrap();
+    assert!(templates::named(&db, "table_ready", "en")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        meta.asked.lock().unwrap().last().unwrap().path,
+        "777/message_templates?hsm_id=13&name=table_ready"
     );
 
     // A message Meta refuses is marked failed with Meta's code and words.
