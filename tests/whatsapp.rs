@@ -410,7 +410,7 @@ async fn a_connection_test_tries_each_part(meta: &FakeMeta) {
     );
     // Nothing stored for these two, and no app subscribed: each says so.
     assert!(matches!(of("App secret"), Outcome::Failed(_)));
-    assert!(matches!(of("Webhook verify token"), Outcome::Failed(_)));
+    assert!(matches!(of("Webhook"), Outcome::Failed(_)));
     assert!(matches!(of("Delivery reports"), Outcome::Failed(_)));
     // Reads alone.
     {

@@ -208,14 +208,32 @@ pub async fn run(field: &(dyn Fn(&str) -> String + Sync)) -> (Vec<Check>, bool) 
         checks.push(check);
     }
 
+    // The webhook, as the app itself has it: Meta saves one only after the
+    // verify token matched, so a saved one proves the token too.
+    let secret_works = checks
+        .iter()
+        .any(|c| c.label.source() == "App secret" && matches!(c.outcome, Outcome::Passed(_)));
     checks.push(Check::new(
-        t!("Webhook verify token"),
+        t!("Webhook"),
         if field("verify_token").is_empty() {
             Outcome::Failed(
                 "No verify token is stored, so Meta cannot set the webhook.".to_string(),
             )
+        } else if !secret_works {
+            Outcome::Later(
+                "A verify token is stored. Whether Meta has the webhook could not be read without a working app secret."
+                    .to_string(),
+            )
         } else {
-            Outcome::Later("Stored. Meta tries it when the webhook is saved.".to_string())
+            match get(
+                format!("{app_id}/subscriptions"),
+                format!("{app_id}|{secret}"),
+            )
+            .await
+            {
+                Ok(answer) => webhook_outcome(&answer),
+                Err(e) => Outcome::Failed(e.message),
+            }
         },
     ));
 
@@ -304,6 +322,57 @@ fn number_outcome(answer: &Value, phone: &str) -> Outcome {
             })
         }
     }
+}
+
+/// Where the webhook lives on the application, and what Meta must send it.
+const WEBHOOK_PATH: &str = "/webhooks/whatsapp";
+const WEBHOOK_FIELDS: [&str; 2] = ["messages", "message_template_status_update"];
+
+/// Whether the app's WhatsApp webhook is set, on, pointed here and sending
+/// what the plugin reads.
+fn webhook_outcome(answer: &Value) -> Outcome {
+    let hook = answer
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|hook| text(hook, "/object") == "whatsapp_business_account");
+    let Some(hook) = hook else {
+        return Outcome::Failed(format!(
+            "The Meta app has no WhatsApp webhook. Set one in the app under WhatsApp > Configuration, with a callback URL ending in {WEBHOOK_PATH}."
+        ));
+    };
+    let url = text(hook, "/callback_url");
+    if !url.trim_end_matches('/').ends_with(WEBHOOK_PATH) {
+        return Outcome::Failed(format!(
+            "Meta delivers to {url}, which is not this application's webhook. The callback URL ends in {WEBHOOK_PATH}."
+        ));
+    }
+    if hook.get("active").and_then(Value::as_bool) == Some(false) {
+        return Outcome::Failed(format!(
+            "The webhook to {url} is switched off in the Meta app."
+        ));
+    }
+    let sent: Vec<String> = hook
+        .get("fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|field| text(field, "/name"))
+        .collect();
+    let missing: Vec<&str> = WEBHOOK_FIELDS
+        .into_iter()
+        .filter(|field| !sent.iter().any(|s| s == field))
+        .collect();
+    if !missing.is_empty() {
+        return Outcome::Failed(format!(
+            "Meta delivers to {url} but does not send {}. Subscribe to it under the webhook's fields in the Meta app.",
+            missing.join(" or ")
+        ));
+    }
+    Outcome::Passed(format!(
+        "Meta delivers to {url}, with messages and template reviews. The verify token matched when it was saved."
+    ))
 }
 
 /// Whether an app is subscribed to the account.
@@ -417,6 +486,34 @@ mod tests {
             token_outcome(&dead),
             Outcome::Failed("Session expired.".to_string())
         );
+    }
+
+    #[test]
+    fn a_webhook_must_point_here_be_on_and_send_both_fields() {
+        let hook = |url: &str, fields: &[&str]| {
+            json!({ "data": [{ "object": "whatsapp_business_account", "callback_url": url, "active": true,
+                "fields": fields.iter().map(|f| json!({ "name": f })).collect::<Vec<_>>() }] })
+        };
+        let both = ["messages", "message_template_status_update"];
+        assert!(matches!(
+            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &both)),
+            Outcome::Passed(_)
+        ));
+        assert!(matches!(
+            webhook_outcome(&hook("https://other.test/hook", &both)),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(
+            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &["messages"])),
+            Outcome::Failed(
+                "Meta delivers to https://acme.test/webhooks/whatsapp but does not send message_template_status_update. Subscribe to it under the webhook's fields in the Meta app."
+                    .to_string()
+            )
+        );
+        assert!(matches!(
+            webhook_outcome(&json!({ "data": [] })),
+            Outcome::Failed(_)
+        ));
     }
 
     #[test]
