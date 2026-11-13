@@ -151,6 +151,9 @@ impl Module for WhatsAppModule {
                 .field(FormField::of("verify_token", t!("Webhook verify token"), "sensitive").help(t!(
                     "Any phrase you choose. Enter the same one where Meta asks for it when you set the webhook."
                 )))
+                .field(FormField::text("callback_url", t!("This account's webhook address")).help(t!(
+                    "Fill it when the Meta app's own webhook belongs to another application: this application's address ending in /webhooks/whatsapp. Subscribe the app then has Meta deliver this account's reports here. Leave blank when the Meta app's webhook already points here."
+                )))
                 .field(FormField::text("graph_version", t!("Graph API version")).help(t!(
                     "Leave blank for the version this plugin was written for."
                 ))),

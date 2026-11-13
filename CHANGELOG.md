@@ -11,3 +11,4 @@ bump is breaking and a patch is additive.
 
 - First cut. WhatsApp Business messaging for Laterite over Meta's Cloud API: the account's message templates mirrored and previewed in the admin, template messages sent through the queue with retries, templates written, previewed and submitted for review from the admin, a signed webhook that records sent, delivered, read and failed, and a Messages screen with figures and charts by outcome, category and template.
 - Test connection on a WhatsApp credential's page tries it against Meta with reads alone: the token and its permissions, the app secret, the account, the phone number, the delivery subscription and the app's webhook. It offers Subscribe the app when no app receives the account's deliveries.
+- A credential's own webhook address: Subscribe the app has Meta deliver that account's reports there, for a Meta app whose webhook belongs to another application.

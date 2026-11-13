@@ -1,7 +1,7 @@
 //! The connection test: every part of the stored credential tried against
 //! Meta with reads alone, so a wrong value is found before a message needs it.
 
-use laterite_core::serde_json::Value;
+use laterite_core::serde_json::{self, Value};
 use laterite_core::strata::async_trait;
 use laterite_core::{t, Text};
 use rainmill_vault::action::{Action, ActionCx, Outcome as ActionOutcome, Part, PartResult, State};
@@ -34,16 +34,24 @@ fn version_of(field: &dyn Fn(&str) -> String) -> String {
 }
 
 /// Subscribes the token's app to the business account, so Meta reports
-/// deliveries and template reviews to the app's webhook. `field` reads the
-/// credential.
+/// deliveries and template reviews. `field` reads the credential. With a
+/// `callback_url` stored, Meta sends this account's reports there in place of
+/// the app's own webhook, after trying the address with the verify token.
 pub async fn subscribe(field: &(dyn Fn(&str) -> String + Sync)) -> Result<(), GraphError> {
+    let callback = field("callback_url");
+    let body = (!callback.is_empty()).then(|| {
+        serde_json::json!({
+            "override_callback_uri": callback,
+            "verify_token": field("verify_token"),
+        })
+    });
     graph::graph()
         .call(Request {
             method: Method::Post,
             version: version_of(field),
             path: format!("{}/subscribed_apps", field("business_account_id")),
             token: field("access_token"),
-            body: None,
+            body,
         })
         .await
         .map(|_| ())
@@ -177,7 +185,7 @@ pub async fn run_part(field: &(dyn Fn(&str) -> String + Sync), part: &str) -> Ou
         }
         "delivery" => match get(&version, format!("{account}/subscribed_apps"), token.clone()).await
         {
-            Ok(answer) => subscription_outcome(&answer),
+            Ok(answer) => subscription_outcome(&answer, &field("callback_url")),
             Err(e) => Outcome::Later(format!(
                 "Who receives the account's deliveries could not be read: {}",
                 e.message
@@ -210,7 +218,7 @@ pub async fn run_part(field: &(dyn Fn(&str) -> String + Sync), part: &str) -> Ou
             )
             .await
             {
-                Ok(answer) => webhook_outcome(&answer),
+                Ok(answer) => webhook_outcome(&answer, &field("callback_url")),
                 Err(e) => unread(&e.message),
             }
         }
@@ -308,7 +316,7 @@ const WEBHOOK_FIELDS: [&str; 2] = ["messages", "message_template_status_update"]
 
 /// Whether the app's WhatsApp webhook is set, on, pointed here and sending
 /// what the plugin reads.
-fn webhook_outcome(answer: &Value) -> Outcome {
+fn webhook_outcome(answer: &Value, own: &str) -> Outcome {
     let hook = answer
         .get("data")
         .and_then(Value::as_array)
@@ -321,7 +329,9 @@ fn webhook_outcome(answer: &Value) -> Outcome {
         ));
     };
     let url = text(hook, "/callback_url");
-    if !url.trim_end_matches('/').ends_with(WEBHOOK_PATH) {
+    // An account with its own address is judged by the fields alone: where
+    // it delivers is the Delivery reports row's to say.
+    if own.is_empty() && !url.trim_end_matches('/').ends_with(WEBHOOK_PATH) {
         return Outcome::Failed(format!(
             "Meta delivers to {url}, which is not this application's webhook. The callback URL ends in {WEBHOOK_PATH}."
         ));
@@ -348,26 +358,59 @@ fn webhook_outcome(answer: &Value) -> Outcome {
             missing.join(" or ")
         ));
     }
+    if !own.is_empty() {
+        return Outcome::Passed(
+            "The Meta app sends messages and template reviews. This account's go to its own address, which Meta tried with the verify token when the app was subscribed."
+                .to_string(),
+        );
+    }
     Outcome::Passed(format!(
         "Meta delivers to {url}, with messages and template reviews. The verify token matched when it was saved."
     ))
 }
 
-/// Whether an app is subscribed to the account.
-fn subscription_outcome(answer: &Value) -> Outcome {
-    let apps: Vec<String> = answer
+/// Whether an app is subscribed to the account and, when the credential
+/// names its own address (`own`), whether Meta delivers the account's reports
+/// there.
+fn subscription_outcome(answer: &Value, own: &str) -> Outcome {
+    let apps: Vec<&Value> = answer
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .collect();
+    let names: Vec<String> = apps
+        .iter()
         .map(|app| text(app, "/whatsapp_business_api_data/name"))
         .collect();
     if apps.is_empty() {
-        Outcome::Failed(
+        return Outcome::Failed(
             "No app is subscribed to this account, so Meta reports no delivery.".to_string(),
-        )
-    } else {
-        Outcome::Passed(format!("Sent to the app {}.", apps.join(", ")))
+        );
+    }
+    if own.is_empty() {
+        return Outcome::Passed(format!(
+            "Sent to the app {}, at the app's own webhook.",
+            names.join(", ")
+        ));
+    }
+    let same = |url: &str| url.trim_end_matches('/') == own.trim_end_matches('/');
+    match apps
+        .iter()
+        .map(|app| text(app, "/override_callback_uri"))
+        .find(|url| !url.is_empty())
+    {
+        Some(url) if same(&url) => Outcome::Passed(format!(
+            "Sent to the app {}, which delivers this account's to {url}.",
+            names.join(", ")
+        )),
+        Some(url) => Outcome::Failed(format!(
+            "This account's reports go to {url}, not to {own}. Subscribe again to move them."
+        )),
+        None => Outcome::Failed(format!(
+            "The app {} is subscribed, but this account's reports go to the app's own webhook, not to {own}. Subscribe again to move them.",
+            names.join(", ")
+        )),
     }
 }
 
@@ -478,24 +521,58 @@ mod tests {
         };
         let both = ["messages", "message_template_status_update"];
         assert!(matches!(
-            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &both)),
+            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &both), ""),
             Outcome::Passed(_)
         ));
         assert!(matches!(
-            webhook_outcome(&hook("https://other.test/hook", &both)),
+            webhook_outcome(&hook("https://other.test/hook", &both), ""),
             Outcome::Failed(_)
         ));
         assert_eq!(
-            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &["messages"])),
+            webhook_outcome(&hook("https://acme.test/webhooks/whatsapp", &["messages"]), ""),
             Outcome::Failed(
                 "Meta delivers to https://acme.test/webhooks/whatsapp but does not send message_template_status_update. Subscribe to it under the webhook's fields in the Meta app."
                     .to_string()
             )
         );
         assert!(matches!(
-            webhook_outcome(&json!({ "data": [] })),
+            webhook_outcome(&json!({ "data": [] }), ""),
             Outcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn an_account_with_its_own_address_must_be_delivered_there() {
+        let own = "https://acme.test/webhooks/whatsapp";
+        let app = |over: Option<&str>| {
+            let mut app = json!({ "whatsapp_business_api_data": { "name": "Acme" } });
+            if let Some(url) = over {
+                app["override_callback_uri"] = json!(url);
+            }
+            json!({ "data": [app] })
+        };
+        assert!(matches!(
+            subscription_outcome(&app(None), ""),
+            Outcome::Passed(_)
+        ));
+        // Subscribed, but to the app's own webhook: another application's.
+        assert!(matches!(
+            subscription_outcome(&app(None), own),
+            Outcome::Failed(_)
+        ));
+        assert!(matches!(
+            subscription_outcome(&app(Some("https://other.test/hook")), own),
+            Outcome::Failed(_)
+        ));
+        assert!(matches!(
+            subscription_outcome(&app(Some(own)), own),
+            Outcome::Passed(_)
+        ));
+        // The app's own address is another application's, and that is fine.
+        let hook = json!({ "data": [{ "object": "whatsapp_business_account",
+            "callback_url": "https://other.test/hook", "active": true,
+            "fields": [{ "name": "messages" }, { "name": "message_template_status_update" }] }] });
+        assert!(matches!(webhook_outcome(&hook, own), Outcome::Passed(_)));
     }
 
     #[test]
