@@ -135,6 +135,7 @@ impl Module for WhatsAppModule {
     fn register(&self, registry: &mut Registry) {
         registry.add(
             KindReg::new(KIND, t!("WhatsApp Cloud API"))
+                .category(rainmill_vault::Category::Messaging)
                 .help(t!(
                     "From Meta Business settings: a system user's permanent token with the WhatsApp permissions, and the ids shown under WhatsApp Manager > Phone numbers."
                 ))
