@@ -10,6 +10,7 @@
 //! ```
 
 mod admin;
+pub mod check;
 pub mod graph;
 pub mod messages;
 pub mod migrations;

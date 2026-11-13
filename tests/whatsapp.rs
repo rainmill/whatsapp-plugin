@@ -29,6 +29,28 @@ struct FakeMeta {
 impl Graph for FakeMeta {
     async fn call(&self, request: Request) -> Result<Value, GraphError> {
         self.asked.lock().unwrap().push(request.clone());
+        if request.path.starts_with("debug_token") {
+            // An app's own token is its id and its secret.
+            if request.token.contains('|') && request.token != "42|shh" {
+                return Err(GraphError {
+                    status: Some(400),
+                    code: Some(190),
+                    message: "Invalid OAuth access token signature.".to_string(),
+                });
+            }
+            return Ok(
+                json!({ "data": { "app_id": "42", "is_valid": true, "expires_at": 0,
+                "scopes": ["whatsapp_business_messaging", "whatsapp_business_management"] } }),
+            );
+        }
+        if request.path.contains("phone_numbers") {
+            return Ok(json!({ "data": [
+                { "id": "555", "display_phone_number": "+1 555 0100", "verified_name": "Acme" }
+            ] }));
+        }
+        if request.path.contains("subscribed_apps") {
+            return Ok(json!({ "data": [] }));
+        }
         if request.path.contains("message_templates") && request.method == Method::Post {
             return Ok(json!({ "id": "13", "status": "PENDING", "category": "UTILITY" }));
         }
@@ -352,4 +374,33 @@ async fn templates_are_mirrored_and_a_message_is_sent_and_followed() {
         column(&db, failed_id, "error_text").await,
         "Message undeliverable"
     );
+
+    a_connection_test_tries_each_part(&db, &crypt, &meta).await;
+}
+
+/// The connection test tries each part and sends nothing.
+async fn a_connection_test_tries_each_part(db: &Db, crypt: &Crypt, meta: &FakeMeta) {
+    use rainmill_whatsapp::check::{run, Outcome};
+    let before = meta.asked.lock().unwrap().len();
+    let checks = run(db, crypt).await;
+    let of = |label: &str| {
+        checks
+            .iter()
+            .find(|c| c.label.source() == label)
+            .map(|c| c.outcome.clone())
+            .unwrap_or_else(|| panic!("no check named {label}"))
+    };
+    assert!(matches!(of("Access token"), Outcome::Passed(_)));
+    assert_eq!(
+        of("Phone number"),
+        Outcome::Passed("+1 555 0100 (Acme).".to_string())
+    );
+    // Nothing stored for these two, and no app subscribed: each says so.
+    assert!(matches!(of("App secret"), Outcome::Failed(_)));
+    assert!(matches!(of("Webhook verify token"), Outcome::Failed(_)));
+    assert!(matches!(of("Delivery reports"), Outcome::Failed(_)));
+    // Reads alone.
+    let asked = meta.asked.lock().unwrap();
+    assert!(asked.len() > before);
+    assert!(asked[before..].iter().all(|r| r.method == Method::Get));
 }

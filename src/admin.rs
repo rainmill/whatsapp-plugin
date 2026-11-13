@@ -121,7 +121,18 @@ impl Screen for Templates {
     fn mount(&self, ctx: &RouteCtx) -> Router {
         let (index_cx, sync_cx, show_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
         let (new_cx, write_cx, delete_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
+        let test_cx = ctx.clone();
         Router::new()
+            .route(
+                "/test",
+                post(
+                    move |Extension(shell): Extension<Shell>,
+                          Extension(user): Extension<AuthenticatedUser>| {
+                        let ctx = test_cx.clone();
+                        async move { test(&ctx, shell, user).await }
+                    },
+                ),
+            )
             .route(
                 "/new",
                 get(move |Extension(shell): Extension<Shell>| {
@@ -229,8 +240,60 @@ async fn index(ctx: &RouteCtx, shell: Shell) -> Response {
             .icon("refresh-cw")
             .render(&shell),
     );
+    actions.push(
+        Button::post(t!("Test connection"), ctx.url("test"))
+            .icon("plug")
+            .render(&shell),
+    );
     shell.page_with(
         PageHead::new(t!("Message templates")).actions(actions),
+        Markup::raw_unchecked(body),
+    )
+}
+
+/// Tries the stored credential against Meta and shows each part's result.
+async fn test(ctx: &RouteCtx, shell: Shell, user: AuthenticatedUser) -> Response {
+    use crate::check::Outcome;
+    let checks = crate::check::run(ctx.db(), ctx.crypt()).await;
+    let failed = checks
+        .iter()
+        .filter(|c| matches!(c.outcome, Outcome::Failed(_)))
+        .count();
+    ctx.audit(
+        &user,
+        "rainmill.whatsapp.test",
+        Some("whatsapp_templates"),
+        None,
+        None,
+        Some(&failed.to_string()),
+    )
+    .await;
+    let mut rows = String::new();
+    for check in &checks {
+        let (tone, word, detail) = match &check.outcome {
+            Outcome::Passed(detail) => ("ok", t!("Works"), detail),
+            Outcome::Failed(detail) => ("bad", t!("Failed"), detail),
+            Outcome::Later(detail) => ("wait", t!("Not tried"), detail),
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><strong>{}</strong></td><td><span class="lat-badge" data-tone="{tone}">{}</span></td><td>{}</td></tr>"#,
+            escape(&shell.tt(&check.label)),
+            escape(&shell.tt(&word)),
+            escape(detail),
+        ));
+    }
+    let body = format!(
+        r#"<p class="lat-note">{}</p><div class="lat-tablewrap"><table class="lat-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+        escape(
+            &shell
+                .t("Each part of the stored credential, tried against Meta. No message was sent.")
+        ),
+        escape(&shell.t("Part")),
+        escape(&shell.t("Result")),
+        escape(&shell.t("What Meta said")),
+    );
+    shell.page_with(
+        PageHead::new(t!("Connection test")).back(t!("Templates"), ctx.url("")),
         Markup::raw_unchecked(body),
     )
 }
