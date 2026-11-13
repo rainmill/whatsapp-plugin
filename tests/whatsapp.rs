@@ -383,7 +383,7 @@ async fn templates_are_mirrored_and_a_message_is_sent_and_followed() {
 
 /// The connection test tries each part and sends nothing.
 async fn a_connection_test_tries_each_part(meta: &FakeMeta) {
-    use rainmill_whatsapp::check::{run, subscribe, Outcome};
+    use rainmill_whatsapp::check::{run_part, subscribe, Outcome, PARTS};
     let field = |name: &str| {
         match name {
             "access_token" => "token-one",
@@ -394,24 +394,27 @@ async fn a_connection_test_tries_each_part(meta: &FakeMeta) {
         .to_string()
     };
     let before = meta.asked.lock().unwrap().len();
-    let (checks, reached) = run(&field).await;
-    assert!(reached, "Meta took the token for the account");
-    let of = |label: &str| {
+    let mut checks = Vec::new();
+    for part in PARTS {
+        checks.push((part, run_part(&field, part).await));
+    }
+    let of = |part: &str| {
         checks
             .iter()
-            .find(|c| c.label.source() == label)
-            .map(|c| c.outcome.clone())
-            .unwrap_or_else(|| panic!("no check named {label}"))
+            .find(|(name, _)| *name == part)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap()
     };
-    assert!(matches!(of("Access token"), Outcome::Passed(_)));
+    assert!(matches!(of("token"), Outcome::Passed(_)));
+    assert!(matches!(of("account"), Outcome::Passed(_)));
     assert_eq!(
-        of("Phone number"),
+        of("phone"),
         Outcome::Passed("+1 555 0100 (Acme).".to_string())
     );
     // Nothing stored for these two, and no app subscribed: each says so.
-    assert!(matches!(of("App secret"), Outcome::Failed(_)));
-    assert!(matches!(of("Webhook"), Outcome::Failed(_)));
-    assert!(matches!(of("Delivery reports"), Outcome::Failed(_)));
+    assert!(matches!(of("secret"), Outcome::Failed(_)));
+    assert!(matches!(of("webhook"), Outcome::Failed(_)));
+    assert!(matches!(of("delivery"), Outcome::Failed(_)));
     // Reads alone.
     {
         let asked = meta.asked.lock().unwrap();
@@ -419,7 +422,6 @@ async fn a_connection_test_tries_each_part(meta: &FakeMeta) {
         assert!(asked[before..].iter().all(|r| r.method == Method::Get));
     }
     // The one write the test offers: subscribing the app to the account.
-    assert!(checks.iter().any(|c| c.subscribable));
     subscribe(&field).await.unwrap();
     let asked = meta.asked.lock().unwrap();
     let last = asked.last().unwrap();

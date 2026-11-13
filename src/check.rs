@@ -4,7 +4,7 @@
 use laterite_core::serde_json::Value;
 use laterite_core::strata::async_trait;
 use laterite_core::{t, Text};
-use rainmill_vault::action::{Action, ActionCx, Line, Outcome as ActionOutcome, Report, State};
+use rainmill_vault::action::{Action, ActionCx, Outcome as ActionOutcome, Part, PartResult, State};
 
 use crate::graph::{self, GraphError, Method, Request};
 
@@ -23,27 +23,6 @@ pub enum Outcome {
     Failed(String),
     /// It is stored, and only a later event proves it.
     Later(String),
-}
-
-/// One line of the test.
-#[derive(Clone, Debug)]
-pub struct Check {
-    /// What was tried.
-    pub label: Text,
-    /// What came of it.
-    pub outcome: Outcome,
-    /// Whether [`subscribe`] mends it.
-    pub subscribable: bool,
-}
-
-impl Check {
-    fn new(label: Text, outcome: Outcome) -> Self {
-        Self {
-            label,
-            outcome,
-            subscribable: false,
-        }
-    }
 }
 
 /// The Graph API version a credential names, else the plugin's own.
@@ -70,86 +49,101 @@ pub async fn subscribe(field: &(dyn Fn(&str) -> String + Sync)) -> Result<(), Gr
         .map(|_| ())
 }
 
-/// Tries a credential, read through `field`: the token and what it may do,
-/// the app secret, the business account, the phone number, and whether an app
-/// receives the account's deliveries. Sends no message. Returns each part's
-/// result and whether Meta took the token for the account.
-pub async fn run(field: &(dyn Fn(&str) -> String + Sync)) -> (Vec<Check>, bool) {
+/// The parts of the test, in the order the page shows them.
+pub const PARTS: [&str; 6] = ["token", "secret", "account", "phone", "delivery", "webhook"];
+
+/// What a part is called on the page.
+pub fn part_label(part: &str) -> Text {
+    match part {
+        "token" => t!("Access token"),
+        "secret" => t!("App secret"),
+        "account" => t!("WhatsApp Business Account"),
+        "phone" => t!("Phone number"),
+        "delivery" => t!("Delivery reports"),
+        "webhook" => t!("Webhook"),
+        other => Text::dynamic(other.to_string()),
+    }
+}
+
+/// One read of the Graph API with `token`.
+async fn get(version: &str, path: String, token: String) -> Result<Value, GraphError> {
+    graph::graph()
+        .call(Request {
+            method: Method::Get,
+            version: version.to_string(),
+            path,
+            token,
+            body: None,
+        })
+        .await
+}
+
+/// The account's numbers: the one call that needs the token, the account and
+/// the token's reach over it all at once.
+async fn numbers(version: &str, account: &str, token: &str) -> Result<Value, GraphError> {
+    get(
+        version,
+        format!("{account}/phone_numbers?fields=id,display_phone_number,verified_name&limit=100"),
+        token.to_string(),
+    )
+    .await
+}
+
+/// Tries one part of a credential, read through `field`, with reads alone:
+/// no message is sent. Each part makes its own calls, so the parts run in any
+/// order or at once.
+pub async fn run_part(field: &(dyn Fn(&str) -> String + Sync), part: &str) -> Outcome {
     let token = field("access_token");
-    let phone = field("phone_number_id");
     let account = field("business_account_id");
     let secret = field("app_secret");
     let version = version_of(field);
-    let get = |path: String, token: String| {
-        let version = version.clone();
-        async move {
-            graph::graph()
-                .call(Request {
-                    method: Method::Get,
-                    version,
-                    path,
-                    token,
-                    body: None,
-                })
-                .await
-        }
-    };
-    let mut checks = Vec::new();
-
-    // The account's numbers: the one call that needs the token, the account
-    // and the token's reach over it all at once.
-    let numbers = if token.is_empty() || account.is_empty() {
-        None
-    } else {
-        Some(
-            get(
-                format!(
-                    "{account}/phone_numbers?fields=id,display_phone_number,verified_name&limit=100"
-                ),
-                token.clone(),
-            )
-            .await,
+    let describe = || {
+        get(
+            &version,
+            format!("debug_token?input_token={token}"),
+            token.clone(),
         )
     };
-    let reached = matches!(numbers, Some(Ok(_)));
-
-    // The token, as Meta describes it.
-    let mut app_id = String::new();
-    if token.is_empty() {
-        checks.push(Check::new(
-            t!("Access token"),
-            Outcome::Failed("No access token is stored.".to_string()),
-        ));
-    } else {
-        let described = get(format!("debug_token?input_token={token}"), token.clone()).await;
-        checks.push(Check::new(
-            t!("Access token"),
-            match &described {
-                Ok(answer) => {
-                    app_id = text(answer, "/data/app_id");
-                    token_outcome(answer)
-                }
-                // Meta will not always describe a token to itself.
-                Err(e) if reached => Outcome::Passed(format!(
+    if token.is_empty() && part != "webhook" {
+        return match part {
+            "token" => Outcome::Failed("No access token is stored.".to_string()),
+            "secret" if secret.is_empty() => Outcome::Failed(
+                "No app secret is stored, so no delivery report can be trusted.".to_string(),
+            ),
+            _ => Outcome::Later("It could not be tried without an access token.".to_string()),
+        };
+    }
+    match part {
+        // The token, as Meta describes it.
+        "token" => match describe().await {
+            Ok(answer) => token_outcome(&answer),
+            // Meta will not always describe a token to itself.
+            Err(e) => match numbers(&version, &account, &token).await {
+                Ok(_) if !account.is_empty() => Outcome::Passed(format!(
                     "Meta takes it for the account. Its permissions and expiry could not be read: {}",
                     e.message
                 )),
-                Err(e) => Outcome::Failed(e.message.clone()),
+                _ => Outcome::Failed(e.message),
             },
-        ));
-    }
-
-    // The app secret: an app's own token is its id and its secret.
-    checks.push(Check::new(
-        t!("App secret"),
-        if secret.is_empty() {
-            Outcome::Failed(
-                "No app secret is stored, so no delivery report can be trusted.".to_string(),
-            )
-        } else if app_id.is_empty() {
-            Outcome::Later("Stored. It could not be tried without a working token.".to_string())
-        } else {
+        },
+        // The app secret: an app's own token is its id and its secret.
+        "secret" => {
+            if secret.is_empty() {
+                return Outcome::Failed(
+                    "No app secret is stored, so no delivery report can be trusted.".to_string(),
+                );
+            }
+            let app_id = match describe().await {
+                Ok(answer) => text(&answer, "/data/app_id"),
+                Err(_) => String::new(),
+            };
+            if app_id.is_empty() {
+                return Outcome::Later(
+                    "Stored. It could not be tried without a working token.".to_string(),
+                );
+            }
             match get(
+                &version,
                 format!("debug_token?input_token={token}"),
                 format!("{app_id}|{secret}"),
             )
@@ -160,84 +154,68 @@ pub async fn run(field: &(dyn Fn(&str) -> String + Sync)) -> (Vec<Check>, bool) 
                     Outcome::Failed(format!("Meta refused it for app {app_id}: {}", e.message))
                 }
             }
-        },
-    ));
-
-    // The business account and the number under it.
-    if account.is_empty() {
-        checks.push(Check::new(
-            t!("WhatsApp Business Account"),
-            Outcome::Failed("No account id is stored.".to_string()),
-        ));
-    }
-    if let Some(numbers) = numbers {
-        match numbers {
-            Ok(answer) => {
-                checks.push(Check::new(
-                    t!("WhatsApp Business Account"),
-                    Outcome::Passed(format!("Account {account} answers.")),
-                ));
-                checks.push(Check::new(
-                    t!("Phone number"),
-                    number_outcome(&answer, &phone),
-                ));
-            }
-            Err(e) => checks.push(Check::new(
-                t!("WhatsApp Business Account"),
-                // A token Meta knows, refused for the account, lacks reach over it.
-                Outcome::Failed(if app_id.is_empty() {
-                    e.message
-                } else {
-                    format!(
-                        "{} The token's system user needs this WhatsApp account assigned to it, with the permission whatsapp_business_management.",
-                        e.message
-                    )
-                }),
-            )),
         }
+        "account" if account.is_empty() => Outcome::Failed("No account id is stored.".to_string()),
+        "account" => match numbers(&version, &account, &token).await {
+            Ok(_) => Outcome::Passed(format!("Account {account} answers.")),
+            // A permission refusal means the token lacks reach over the account.
+            Err(e) if matches!(e.code, Some(10 | 100 | 200)) => Outcome::Failed(format!(
+                "{} The token's system user needs this WhatsApp account assigned to it, with the permission whatsapp_business_management.",
+                e.message
+            )),
+            Err(e) => Outcome::Failed(e.message),
+        },
+        "phone" => match numbers(&version, &account, &token).await {
+            Ok(answer) if !account.is_empty() => {
+                number_outcome(&answer, &field("phone_number_id"))
+            }
+            _ => Outcome::Later("The account's numbers could not be read.".to_string()),
+        },
         // Without a subscribed app Meta reports no delivery to anyone.
-        let subscribed = get(format!("{account}/subscribed_apps"), token.clone()).await;
-        let mut check = Check::new(
-            t!("Delivery reports"),
-            match &subscribed {
-                Ok(answer) => subscription_outcome(answer),
-                Err(e) => Outcome::Failed(e.message.clone()),
-            },
-        );
-        check.subscribable = subscribed.is_ok() && matches!(check.outcome, Outcome::Failed(_));
-        checks.push(check);
-    }
-
-    // The webhook, as the app itself has it: Meta saves one only after the
-    // verify token matched, so a saved one proves the token too.
-    let secret_works = checks
-        .iter()
-        .any(|c| c.label.source() == "App secret" && matches!(c.outcome, Outcome::Passed(_)));
-    checks.push(Check::new(
-        t!("Webhook"),
-        if field("verify_token").is_empty() {
-            Outcome::Failed(
-                "No verify token is stored, so Meta cannot set the webhook.".to_string(),
-            )
-        } else if !secret_works {
-            Outcome::Later(
-                "A verify token is stored. Whether Meta has the webhook could not be read without a working app secret."
-                    .to_string(),
-            )
-        } else {
+        "delivery" if account.is_empty() => {
+            Outcome::Later("It could not be tried without an account id.".to_string())
+        }
+        "delivery" => match get(&version, format!("{account}/subscribed_apps"), token.clone()).await
+        {
+            Ok(answer) => subscription_outcome(&answer),
+            Err(e) => Outcome::Later(format!(
+                "Who receives the account's deliveries could not be read: {}",
+                e.message
+            )),
+        },
+        // The webhook, as the app itself has it: Meta saves one only after the
+        // verify token matched, so a saved one proves the token too.
+        "webhook" => {
+            if field("verify_token").is_empty() {
+                return Outcome::Failed(
+                    "No verify token is stored, so Meta cannot set the webhook.".to_string(),
+                );
+            }
+            let unread = |why: &str| {
+                Outcome::Later(format!(
+                    "A verify token is stored. Whether Meta has the webhook could not be read: {why}"
+                ))
+            };
+            if token.is_empty() || secret.is_empty() {
+                return unread("it takes a working token and app secret.");
+            }
+            let app_id = match describe().await {
+                Ok(answer) => text(&answer, "/data/app_id"),
+                Err(e) => return unread(&e.message),
+            };
             match get(
+                &version,
                 format!("{app_id}/subscriptions"),
                 format!("{app_id}|{secret}"),
             )
             .await
             {
                 Ok(answer) => webhook_outcome(&answer),
-                Err(e) => Outcome::Failed(e.message),
+                Err(e) => unread(&e.message),
             }
-        },
-    ));
-
-    (checks, reached)
+        }
+        _ => Outcome::Later(String::new()),
+    }
 }
 
 /// The text at `pointer`, a number read as text.
@@ -398,39 +376,43 @@ fn reader<'a>(cx: &'a ActionCx<'_>) -> impl Fn(&str) -> String + Sync + 'a {
     move |name| cx.field(name).unwrap_or_default().trim().to_string()
 }
 
-/// Test connection, on the credential's page.
+/// Test connection, on the credential's page: one row a part, each tried on
+/// its own.
 pub(crate) struct Test;
 
 #[async_trait]
 impl Action for Test {
-    async fn run(&self, cx: &ActionCx<'_>) -> ActionOutcome {
-        let (checks, reached) = run(&reader(cx)).await;
-        let offer = checks
-            .iter()
-            .any(|check| check.subscribable)
-            .then(|| SUBSCRIBE.to_string());
-        ActionOutcome::Report(Report {
-            note: Some(t!(
-                "Each part of the credential, tried against Meta. No message was sent."
-            )),
-            lines: checks
-                .into_iter()
-                .map(|check| {
-                    let (state, detail) = match check.outcome {
-                        Outcome::Passed(detail) => (State::Works, detail),
-                        Outcome::Failed(detail) => (State::Failed, detail),
-                        Outcome::Later(detail) => (State::NotTried, detail),
-                    };
-                    Line {
-                        label: check.label,
-                        state,
-                        detail,
-                    }
-                })
-                .collect(),
-            accepted: reached.then_some(true),
-            offer: offer.into_iter().collect(),
-        })
+    fn parts(&self) -> Vec<Part> {
+        PARTS
+            .into_iter()
+            .map(|part| Part::new(part, part_label(part)))
+            .collect()
+    }
+
+    fn note(&self) -> Option<Text> {
+        Some(t!(
+            "Each part of the credential, tried against Meta. No message is sent."
+        ))
+    }
+
+    async fn part(&self, cx: &ActionCx<'_>, code: &str) -> PartResult {
+        let outcome = run_part(&reader(cx), code).await;
+        // The account answering is Meta taking the credential; an account
+        // with no app subscribed is mended by subscribing one.
+        let accepted = code == "account" && matches!(outcome, Outcome::Passed(_));
+        let unsubscribed = code == "delivery" && matches!(outcome, Outcome::Failed(_));
+        let (state, detail) = match outcome {
+            Outcome::Passed(detail) => (State::Works, detail),
+            Outcome::Failed(detail) => (State::Failed, detail),
+            Outcome::Later(detail) => (State::NotTried, detail),
+        };
+        let result = PartResult::new(state, detail);
+        let result = if accepted { result.accepted() } else { result };
+        if unsubscribed {
+            result.offer(SUBSCRIBE)
+        } else {
+            result
+        }
     }
 }
 
