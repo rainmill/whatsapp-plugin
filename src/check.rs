@@ -4,7 +4,7 @@
 use laterite_core::serde_json::Value;
 use laterite_core::{t, Crypt, Db, Text};
 
-use crate::graph::{self, GraphError, Method, Request};
+use crate::graph::{self, Method, Request};
 use crate::SLOT;
 
 /// The permissions a token needs: to send, and to read and write templates.
@@ -43,7 +43,7 @@ impl Check {
 /// may do, the app secret, the business account, the phone number, and whether
 /// an app receives the account's deliveries. Sends no message.
 pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
-    let lease = match rainmill_vault::lease(db, crypt, SLOT).await {
+    let lease = match rainmill_vault::inspect(db, crypt, SLOT).await {
         Ok(lease) => lease,
         Err(e) => return vec![Check::new(t!("Credential"), Outcome::Failed(format!(
                     "No credential could be used ({e}). Store one under Credentials and attach it to WhatsApp messages."
@@ -73,7 +73,23 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
         }
     };
     let mut checks = Vec::new();
-    let mut refusal: Option<GraphError> = None;
+
+    // The account's numbers: the one call that needs the token, the account
+    // and the token's reach over it all at once.
+    let numbers = if token.is_empty() || account.is_empty() {
+        None
+    } else {
+        Some(
+            get(
+                format!(
+                    "{account}/phone_numbers?fields=id,display_phone_number,verified_name&limit=100"
+                ),
+                token.clone(),
+            )
+            .await,
+        )
+    };
+    let reached = matches!(numbers, Some(Ok(_)));
 
     // The token, as Meta describes it.
     let mut app_id = String::new();
@@ -91,12 +107,14 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
                     app_id = text(answer, "/data/app_id");
                     token_outcome(answer)
                 }
+                // Meta will not always describe a token to itself.
+                Err(e) if reached => Outcome::Passed(format!(
+                    "Meta takes it for the account. Its permissions and expiry could not be read: {}",
+                    e.message
+                )),
                 Err(e) => Outcome::Failed(e.message.clone()),
             },
         ));
-        if let Err(e) = described {
-            refusal = Some(e);
-        }
     }
 
     // The app secret: an app's own token is its id and its secret.
@@ -129,14 +147,8 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
             t!("WhatsApp Business Account"),
             Outcome::Failed("No account id is stored.".to_string()),
         ));
-    } else if !token.is_empty() {
-        let numbers = get(
-            format!(
-                "{account}/phone_numbers?fields=id,display_phone_number,verified_name&limit=100"
-            ),
-            token.clone(),
-        )
-        .await;
+    }
+    if let Some(numbers) = numbers {
         match numbers {
             Ok(answer) => {
                 checks.push(Check::new(
@@ -148,13 +160,13 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
                     number_outcome(&answer, &phone),
                 ));
             }
-            Err(e) => {
-                checks.push(Check::new(
-                    t!("WhatsApp Business Account"),
-                    Outcome::Failed(e.message.clone()),
-                ));
-                refusal.get_or_insert(e);
-            }
+            Err(e) => checks.push(Check::new(
+                t!("WhatsApp Business Account"),
+                Outcome::Failed(format!(
+                    "{} The token's system user needs this WhatsApp account assigned to it, with the permission whatsapp_business_management.",
+                    e.message
+                )),
+            )),
         }
         // Without a subscribed app Meta reports no delivery to anyone.
         checks.push(Check::new(
@@ -177,12 +189,12 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
         },
     ));
 
-    let recorded = match &refusal {
-        Some(e) => lease.failed(e.status, &e.message).await,
-        None => lease.used(0).await,
-    };
-    if let Err(e) = recorded {
-        tracing::warn!(error = %e, "the test could not be recorded");
+    // A test never puts the credential out of use; one Meta took for the
+    // account puts it back in good standing.
+    if reached {
+        if let Err(e) = lease.used(0).await {
+            tracing::warn!(error = %e, "the test could not be recorded");
+        }
     }
     checks
 }
