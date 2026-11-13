@@ -167,6 +167,24 @@ impl Module for WhatsAppModule {
                 .meter("authentication", t!("Authentication"))
                 .meter("service", t!("Service")),
         );
+        registry.add(
+            rainmill_vault::ActionReg::new(
+                KIND,
+                check::TEST,
+                t!("Test connection"),
+                std::sync::Arc::new(check::Test),
+            )
+            .icon("plug"),
+        );
+        registry.add(
+            rainmill_vault::ActionReg::new(
+                KIND,
+                check::SUBSCRIBE,
+                t!("Subscribe the app"),
+                std::sync::Arc::new(check::Subscribe),
+            )
+            .unlisted(),
+        );
         laterite_core::queue::QueueRegistry::add_job::<messages::SendMessage>(registry);
         admin::register(registry);
         webhook::register(registry);

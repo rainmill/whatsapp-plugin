@@ -2,10 +2,11 @@
 //! Meta with reads alone, so a wrong value is found before a message needs it.
 
 use laterite_core::serde_json::Value;
-use laterite_core::{t, Crypt, Db, Text};
+use laterite_core::strata::async_trait;
+use laterite_core::{t, Text};
+use rainmill_vault::action::{Action, ActionCx, Line, Outcome as ActionOutcome, Report, State};
 
-use crate::graph::{self, Method, Request};
-use crate::SLOT;
+use crate::graph::{self, GraphError, Method, Request};
 
 /// The permissions a token needs: to send, and to read and write templates.
 const SCOPES: [&str; 2] = [
@@ -45,42 +46,40 @@ impl Check {
     }
 }
 
-/// Subscribes the token's app to the business account, so Meta reports
-/// deliveries and template reviews to the app's webhook.
-pub async fn subscribe(db: &Db, crypt: &Crypt) -> Result<(), crate::WhatsAppError> {
-    let account = crate::Account::lease(db, crypt).await?;
-    let path = format!("{}/subscribed_apps", account.business_account_id);
-    match account.call(Method::Post, &path, None).await {
-        Ok(_) => {
-            account.used().await;
-            Ok(())
-        }
-        Err(e) => {
-            account.failed(&e).await;
-            Err(e.into())
-        }
+/// The Graph API version a credential names, else the plugin's own.
+fn version_of(field: &dyn Fn(&str) -> String) -> String {
+    match field("graph_version") {
+        version if version.is_empty() => graph::DEFAULT_VERSION.to_string(),
+        version => version,
     }
 }
 
-/// Tries the credential attached to the plugin's slot: the token and what it
-/// may do, the app secret, the business account, the phone number, and whether
-/// an app receives the account's deliveries. Sends no message.
-pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
-    let lease = match rainmill_vault::inspect(db, crypt, SLOT).await {
-        Ok(lease) => lease,
-        Err(e) => return vec![Check::new(t!("Credential"), Outcome::Failed(format!(
-                    "No credential could be used ({e}). Store one under Credentials and attach it to WhatsApp messages."
-                )))],
-    };
-    let field = |name: &str| lease.field(name).unwrap_or_default().trim().to_string();
+/// Subscribes the token's app to the business account, so Meta reports
+/// deliveries and template reviews to the app's webhook. `field` reads the
+/// credential.
+pub async fn subscribe(field: &(dyn Fn(&str) -> String + Sync)) -> Result<(), GraphError> {
+    graph::graph()
+        .call(Request {
+            method: Method::Post,
+            version: version_of(field),
+            path: format!("{}/subscribed_apps", field("business_account_id")),
+            token: field("access_token"),
+            body: None,
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Tries a credential, read through `field`: the token and what it may do,
+/// the app secret, the business account, the phone number, and whether an app
+/// receives the account's deliveries. Sends no message. Returns each part's
+/// result and whether Meta took the token for the account.
+pub async fn run(field: &(dyn Fn(&str) -> String + Sync)) -> (Vec<Check>, bool) {
     let token = field("access_token");
     let phone = field("phone_number_id");
     let account = field("business_account_id");
     let secret = field("app_secret");
-    let version = match field("graph_version") {
-        version if version.is_empty() => graph::DEFAULT_VERSION.to_string(),
-        version => version,
-    };
+    let version = version_of(field);
     let get = |path: String, token: String| {
         let version = version.clone();
         async move {
@@ -185,10 +184,15 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
             }
             Err(e) => checks.push(Check::new(
                 t!("WhatsApp Business Account"),
-                Outcome::Failed(format!(
-                    "{} The token's system user needs this WhatsApp account assigned to it, with the permission whatsapp_business_management.",
+                // A token Meta knows, refused for the account, lacks reach over it.
+                Outcome::Failed(if app_id.is_empty() {
                     e.message
-                )),
+                } else {
+                    format!(
+                        "{} The token's system user needs this WhatsApp account assigned to it, with the permission whatsapp_business_management.",
+                        e.message
+                    )
+                }),
             )),
         }
         // Without a subscribed app Meta reports no delivery to anyone.
@@ -215,14 +219,7 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
         },
     ));
 
-    // A test never puts the credential out of use; one Meta took for the
-    // account puts it back in good standing.
-    if reached {
-        if let Err(e) = lease.used(0).await {
-            tracing::warn!(error = %e, "the test could not be recorded");
-        }
-    }
-    checks
+    (checks, reached)
 }
 
 /// The text at `pointer`, a number read as text.
@@ -326,6 +323,70 @@ fn subscription_outcome(answer: &Value) -> Outcome {
         Outcome::Passed(format!("Sent to the app {}.", apps.join(", ")))
     }
 }
+
+/// The credential's fields, trimmed, as the checks read them.
+fn reader<'a>(cx: &'a ActionCx<'_>) -> impl Fn(&str) -> String + Sync + 'a {
+    move |name| cx.field(name).unwrap_or_default().trim().to_string()
+}
+
+/// Test connection, on the credential's page.
+pub(crate) struct Test;
+
+#[async_trait]
+impl Action for Test {
+    async fn run(&self, cx: &ActionCx<'_>) -> ActionOutcome {
+        let (checks, reached) = run(&reader(cx)).await;
+        let offer = checks
+            .iter()
+            .any(|check| check.subscribable)
+            .then(|| SUBSCRIBE.to_string());
+        ActionOutcome::Report(Report {
+            note: Some(t!(
+                "Each part of the credential, tried against Meta. No message was sent."
+            )),
+            lines: checks
+                .into_iter()
+                .map(|check| {
+                    let (state, detail) = match check.outcome {
+                        Outcome::Passed(detail) => (State::Works, detail),
+                        Outcome::Failed(detail) => (State::Failed, detail),
+                        Outcome::Later(detail) => (State::NotTried, detail),
+                    };
+                    Line {
+                        label: check.label,
+                        state,
+                        detail,
+                    }
+                })
+                .collect(),
+            accepted: reached.then_some(true),
+            offer: offer.into_iter().collect(),
+        })
+    }
+}
+
+/// Subscribe the app, offered by the test when no app receives deliveries.
+pub(crate) struct Subscribe;
+
+#[async_trait]
+impl Action for Subscribe {
+    async fn run(&self, cx: &ActionCx<'_>) -> ActionOutcome {
+        match subscribe(&reader(cx)).await {
+            Ok(()) => ActionOutcome::Done(t!(
+                "The app is subscribed to the account. Test the connection again to see it."
+            )),
+            Err(e) => ActionOutcome::Failed(Text::dynamic(format!(
+                "The app could not be subscribed: {}",
+                e.message
+            ))),
+        }
+    }
+}
+
+/// The code of the test's action.
+pub(crate) const TEST: &str = "test";
+/// The code of the subscribe action.
+pub(crate) const SUBSCRIBE: &str = "subscribe";
 
 #[cfg(test)]
 mod tests {

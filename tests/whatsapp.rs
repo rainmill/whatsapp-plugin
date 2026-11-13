@@ -378,14 +378,24 @@ async fn templates_are_mirrored_and_a_message_is_sent_and_followed() {
         "Message undeliverable"
     );
 
-    a_connection_test_tries_each_part(&db, &crypt, &meta).await;
+    a_connection_test_tries_each_part(&meta).await;
 }
 
 /// The connection test tries each part and sends nothing.
-async fn a_connection_test_tries_each_part(db: &Db, crypt: &Crypt, meta: &FakeMeta) {
-    use rainmill_whatsapp::check::{run, Outcome};
+async fn a_connection_test_tries_each_part(meta: &FakeMeta) {
+    use rainmill_whatsapp::check::{run, subscribe, Outcome};
+    let field = |name: &str| {
+        match name {
+            "access_token" => "token-one",
+            "phone_number_id" => "555",
+            "business_account_id" => "777",
+            _ => "",
+        }
+        .to_string()
+    };
     let before = meta.asked.lock().unwrap().len();
-    let checks = run(db, crypt).await;
+    let (checks, reached) = run(&field).await;
+    assert!(reached, "Meta took the token for the account");
     let of = |label: &str| {
         checks
             .iter()
@@ -410,9 +420,7 @@ async fn a_connection_test_tries_each_part(db: &Db, crypt: &Crypt, meta: &FakeMe
     }
     // The one write the test offers: subscribing the app to the account.
     assert!(checks.iter().any(|c| c.subscribable));
-    rainmill_whatsapp::check::subscribe(db, crypt)
-        .await
-        .unwrap();
+    subscribe(&field).await.unwrap();
     let asked = meta.asked.lock().unwrap();
     let last = asked.last().unwrap();
     assert_eq!(last.method, Method::Post);
