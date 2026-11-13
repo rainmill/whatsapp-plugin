@@ -121,8 +121,18 @@ impl Screen for Templates {
     fn mount(&self, ctx: &RouteCtx) -> Router {
         let (index_cx, sync_cx, show_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
         let (new_cx, write_cx, delete_cx) = (ctx.clone(), ctx.clone(), ctx.clone());
-        let test_cx = ctx.clone();
+        let (test_cx, subscribe_cx) = (ctx.clone(), ctx.clone());
         Router::new()
+            .route(
+                "/subscribe",
+                post(
+                    move |Extension(user): Extension<AuthenticatedUser>,
+                          Extension(session): Extension<SessionHandle>| {
+                        let ctx = subscribe_cx.clone();
+                        async move { subscribe(&ctx, user, session).await }
+                    },
+                ),
+            )
             .route(
                 "/test",
                 post(
@@ -292,10 +302,41 @@ async fn test(ctx: &RouteCtx, shell: Shell, user: AuthenticatedUser) -> Response
         escape(&shell.t("Result")),
         escape(&shell.t("What Meta said")),
     );
-    shell.page_with(
-        PageHead::new(t!("Connection test")).back(t!("Templates"), ctx.url("")),
-        Markup::raw_unchecked(body),
-    )
+    let mut head = PageHead::new(t!("Connection test")).back(t!("Templates"), ctx.url(""));
+    if checks.iter().any(|check| check.subscribable) {
+        head = head.actions(
+            Button::post(t!("Subscribe the app"), ctx.url("subscribe"))
+                .primary()
+                .render(&shell),
+        );
+    }
+    shell.page_with(head, Markup::raw_unchecked(body))
+}
+
+/// Subscribes the token's app to the account, then returns to the templates.
+async fn subscribe(ctx: &RouteCtx, user: AuthenticatedUser, session: SessionHandle) -> Response {
+    match crate::check::subscribe(ctx.db(), ctx.crypt()).await {
+        Ok(()) => {
+            ctx.audit(
+                &user,
+                "rainmill.whatsapp.subscribe",
+                Some("whatsapp_templates"),
+                None,
+                None,
+                None,
+            )
+            .await;
+            session.push_flash(
+                FlashLevel::Success,
+                t!("The app is subscribed to the account. Test the connection again to see it."),
+            );
+        }
+        Err(e) => session.push_flash(
+            FlashLevel::Error,
+            Text::dynamic(format!("The app could not be subscribed: {e}")),
+        ),
+    }
+    Redirect::to(&ctx.url("")).into_response()
 }
 
 async fn sync(ctx: &RouteCtx, user: AuthenticatedUser, session: SessionHandle) -> Response {

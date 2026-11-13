@@ -31,11 +31,34 @@ pub struct Check {
     pub label: Text,
     /// What came of it.
     pub outcome: Outcome,
+    /// Whether [`subscribe`] mends it.
+    pub subscribable: bool,
 }
 
 impl Check {
     fn new(label: Text, outcome: Outcome) -> Self {
-        Self { label, outcome }
+        Self {
+            label,
+            outcome,
+            subscribable: false,
+        }
+    }
+}
+
+/// Subscribes the token's app to the business account, so Meta reports
+/// deliveries and template reviews to the app's webhook.
+pub async fn subscribe(db: &Db, crypt: &Crypt) -> Result<(), crate::WhatsAppError> {
+    let account = crate::Account::lease(db, crypt).await?;
+    let path = format!("{}/subscribed_apps", account.business_account_id);
+    match account.call(Method::Post, &path, None).await {
+        Ok(_) => {
+            account.used().await;
+            Ok(())
+        }
+        Err(e) => {
+            account.failed(&e).await;
+            Err(e.into())
+        }
     }
 }
 
@@ -169,13 +192,16 @@ pub async fn run(db: &Db, crypt: &Crypt) -> Vec<Check> {
             )),
         }
         // Without a subscribed app Meta reports no delivery to anyone.
-        checks.push(Check::new(
+        let subscribed = get(format!("{account}/subscribed_apps"), token.clone()).await;
+        let mut check = Check::new(
             t!("Delivery reports"),
-            match get(format!("{account}/subscribed_apps"), token.clone()).await {
-                Ok(answer) => subscription_outcome(&answer),
-                Err(e) => Outcome::Failed(e.message),
+            match &subscribed {
+                Ok(answer) => subscription_outcome(answer),
+                Err(e) => Outcome::Failed(e.message.clone()),
             },
-        ));
+        );
+        check.subscribable = subscribed.is_ok() && matches!(check.outcome, Outcome::Failed(_));
+        checks.push(check);
     }
 
     checks.push(Check::new(
@@ -294,8 +320,7 @@ fn subscription_outcome(answer: &Value) -> Outcome {
         .collect();
     if apps.is_empty() {
         Outcome::Failed(
-            "No app is subscribed to this account, so Meta reports no delivery. Subscribe the app to the account."
-                .to_string(),
+            "No app is subscribed to this account, so Meta reports no delivery.".to_string(),
         )
     } else {
         Outcome::Passed(format!("Sent to the app {}.", apps.join(", ")))

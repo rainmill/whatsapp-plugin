@@ -49,6 +49,9 @@ impl Graph for FakeMeta {
             ] }));
         }
         if request.path.contains("subscribed_apps") {
+            if request.method == Method::Post {
+                return Ok(json!({ "success": true }));
+            }
             return Ok(json!({ "data": [] }));
         }
         if request.path.contains("message_templates") && request.method == Method::Post {
@@ -400,7 +403,18 @@ async fn a_connection_test_tries_each_part(db: &Db, crypt: &Crypt, meta: &FakeMe
     assert!(matches!(of("Webhook verify token"), Outcome::Failed(_)));
     assert!(matches!(of("Delivery reports"), Outcome::Failed(_)));
     // Reads alone.
+    {
+        let asked = meta.asked.lock().unwrap();
+        assert!(asked.len() > before);
+        assert!(asked[before..].iter().all(|r| r.method == Method::Get));
+    }
+    // The one write the test offers: subscribing the app to the account.
+    assert!(checks.iter().any(|c| c.subscribable));
+    rainmill_whatsapp::check::subscribe(db, crypt)
+        .await
+        .unwrap();
     let asked = meta.asked.lock().unwrap();
-    assert!(asked.len() > before);
-    assert!(asked[before..].iter().all(|r| r.method == Method::Get));
+    let last = asked.last().unwrap();
+    assert_eq!(last.method, Method::Post);
+    assert_eq!(last.path, "777/subscribed_apps");
 }
