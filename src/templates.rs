@@ -99,9 +99,41 @@ impl Template {
             .unwrap_or_default()
     }
 
+    /// The body as written, with its `{{n}}` in place.
+    pub fn body_text(&self) -> String {
+        self.component("BODY")
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The sample Meta holds for each value the body takes, in order.
+    pub fn body_samples(&self) -> Vec<String> {
+        self.component("BODY")
+            .and_then(|c| c.pointer("/example/body_text/0"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The message as it was written: every `{{n}}` left in place.
+    pub fn outline(&self) -> Preview {
+        self.drawn(&[], None, false)
+    }
+
     /// The message as a recipient reads it, with `body` and `button` filled
     /// in. A parameter with no value keeps Meta's own sample, or its `{{n}}`.
     pub fn preview(&self, body: &[String], button: Option<&str>) -> Preview {
+        self.drawn(body, button, true)
+    }
+
+    fn drawn(&self, body: &[String], button: Option<&str>, sampled: bool) -> Preview {
         let text_of = |kind: &str| {
             self.component(kind)
                 .and_then(|c| c.get("text"))
@@ -123,6 +155,7 @@ impl Template {
         };
         let fill = |text: String, given: &[String], samples: &[String]| {
             let mut out = text;
+            let samples: &[String] = if sampled { samples } else { &[] };
             for n in 1..=given.len().max(samples.len()) {
                 if let Some(value) = given.get(n - 1).or_else(|| samples.get(n - 1)) {
                     out = out.replace(&format!("{{{{{n}}}}}"), value);
@@ -161,7 +194,14 @@ impl Template {
             .into_iter()
             .collect();
         let given_button: Vec<String> = button.map(str::to_string).into_iter().collect();
+        let media = self
+            .component("HEADER")
+            .and_then(|c| c.get("format"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_uppercase)
+            .filter(|format| format != "TEXT");
         Preview {
+            media,
             header,
             body: fill(
                 text_of("BODY"),
@@ -183,6 +223,9 @@ impl Template {
 /// A template as a recipient reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Preview {
+    /// The header's kind when it is not text: `IMAGE`, `VIDEO`, `DOCUMENT`
+    /// or `LOCATION`.
+    pub media: Option<String>,
     /// The header line, when the template has a text header.
     pub header: Option<String>,
     /// The body.

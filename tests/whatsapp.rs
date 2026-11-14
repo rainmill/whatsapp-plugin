@@ -292,6 +292,28 @@ async fn templates_are_mirrored_and_a_message_is_sent_and_followed() {
     );
     assert_eq!(column(&db, id, "state").await, "read");
 
+    // The template's tally counts a read message as sent and delivered too,
+    // and as charged once Meta said so.
+    let tallies = rainmill_whatsapp::messages::tallies(&db, "2000-01-01")
+        .await
+        .unwrap();
+    let tally = tallies[&("order_ready".to_string(), "en".to_string())];
+    assert_eq!(
+        (
+            tally.sent,
+            tally.delivered,
+            tally.read,
+            tally.failed,
+            tally.charged
+        ),
+        (1, 1, 1, 0, 1)
+    );
+    let recent = rainmill_whatsapp::messages::recent(&db, "order_ready", "en", 10)
+        .await
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].state, "read");
+
     // A review result reaches the mirror; Meta writes the language its own way.
     let review = json!({ "entry": [{ "changes": [{ "field": "message_template_status_update", "value": {
         "event": "REJECTED", "message_template_name": "big_sale", "message_template_language": "en",

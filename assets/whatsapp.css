@@ -1,0 +1,75 @@
+/* The WhatsApp screens: a message drawn as a phone shows it, a template's
+   head, and the editor beside its preview. */
+.wa-split{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:24px;align-items:start}
+.wa-split__side{position:sticky;top:16px;min-width:0}
+.wa-split__main{display:grid;gap:16px;min-width:0}
+.wa-split__main>.lat-card,.wa-split__side>.lat-card{margin:0}
+@media (max-width:1100px){.wa-split{grid-template-columns:minmax(0,1fr)}.wa-split__side{position:static;order:-1}}
+
+.wa-head{display:flex;gap:14px;align-items:center;margin:0 0 16px}
+.wa-tile{flex:none;display:grid;place-items:center;width:48px;height:48px;border-radius:10px;color:#fff;background:#0b8a6a}
+.wa-tile svg{width:22px;height:22px}
+.wa-tile[data-category="MARKETING"]{background:#b4540a}
+.wa-tile[data-category="AUTHENTICATION"]{background:#2f5fb3}
+.wa-tile--sm{width:32px;height:32px;border-radius:8px}
+.wa-tile--sm svg{width:16px;height:16px}
+.wa-head__name{margin:0;font-size:var(--fs-18);font-weight:var(--fw-semibold,600);overflow-wrap:anywhere}
+.wa-meta{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;margin-top:4px;color:var(--text-muted);font-size:var(--fs-13)}
+.wa-meta code{font-size:var(--fs-12)}
+.wa-meta__sep{opacity:.5}
+
+.wa-pill{display:inline-flex;align-items:center;gap:6px;padding:1px 9px;border-radius:999px;font-size:var(--fs-12);font-weight:var(--fw-medium,500);border:1px solid var(--border-subtle);color:var(--text-muted);white-space:nowrap}
+.wa-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.wa-pill[data-tone="ok"]{color:var(--success);background:var(--success-subtle);border-color:transparent}
+.wa-pill[data-tone="bad"]{color:var(--danger-700);background:var(--danger-subtle);border-color:transparent}
+.wa-pill[data-tone="wait"]{color:var(--ochre-500,#a16207)}
+
+.wa-name{display:flex;gap:10px;align-items:center;min-width:0}
+.wa-name a{font-weight:var(--fw-semibold,600);overflow-wrap:anywhere}
+.wa-snippet{display:block;max-width:40ch;color:var(--text-muted);font-size:var(--fs-12);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wa-num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.wa-list th{white-space:nowrap}
+.wa-list .wa-sub{min-width:16ch}
+.wa-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+@media (max-width:760px){.wa-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.wa-sub{display:block;color:var(--text-muted);font-size:var(--fs-12)}
+.wa-error{display:block;max-width:72ch;margin-top:4px;color:var(--text-muted);overflow-wrap:anywhere}
+.wa-filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px}
+.wa-filters .lat-input{width:auto;min-width:150px}
+.wa-filters input[type="search"]{flex:1 1 220px}
+
+/* The phone. Its colours are WhatsApp's own in both colour modes: it is a
+   picture of the recipient's screen. */
+.wa-chat{padding:18px 16px 20px 22px;border-radius:12px;background-color:#efe7de;background-image:radial-gradient(rgba(11,20,26,.05) 1px,transparent 1.5px);background-size:14px 14px}
+.wa-bubble{position:relative;max-width:330px;border-radius:0 8px 8px 8px;background:#fff;color:#111b21;box-shadow:0 1px .5px rgba(11,20,26,.18);font:14.2px/19px -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.wa-bubble::before{content:"";position:absolute;top:0;left:-8px;border-style:solid;border-width:0 8px 10px 0;border-color:transparent #fff transparent transparent}
+.wa-bubble__media{display:flex;flex-direction:column;gap:4px;align-items:center;justify-content:center;height:150px;margin:3px 3px 0;border-radius:6px;background:#d9dbd5;color:#667781;font-size:12px}
+.wa-bubble__media svg{width:28px;height:28px}
+.wa-bubble__text{padding:7px 9px 2px}
+.wa-bubble__header{margin-bottom:4px;font-weight:600}
+.wa-bubble__body{white-space:pre-wrap;overflow-wrap:anywhere}
+.wa-bubble__body code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.wa-bubble__footer{margin-top:4px;color:#667781;font-size:13px}
+.wa-bubble__time{padding:0 9px 5px;color:#667781;font-size:11px;text-align:right}
+.wa-bubble__btn{display:flex;gap:7px;align-items:center;justify-content:center;padding:10px 12px;border-top:1px solid #e9edef;color:#008069;font-size:14px;overflow-wrap:anywhere}
+.wa-bubble__btn svg{flex:none;width:16px;height:16px}
+.wa-bubble__empty{color:#8696a0}
+.wa-var{padding:0 4px;border-radius:4px;background:rgba(0,128,105,.12);color:#005c4b;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;white-space:nowrap}
+.wa-preview__head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 12px}
+.wa-preview__head h2{margin:0}
+.wa-toggle{display:inline-flex;border:1px solid var(--border-default);border-radius:var(--radius-pill);overflow:hidden;font-size:var(--fs-12)}
+.wa-toggle a{padding:3px 11px;color:var(--text-muted);text-decoration:none}
+.wa-toggle a.is-on{background:var(--surface-sunken);color:var(--text-body);font-weight:var(--fw-medium,500)}
+
+/* The editor. */
+.wa-count{float:right;color:var(--text-muted);font-size:var(--fs-12);font-variant-numeric:tabular-nums}
+.wa-count.is-over{color:var(--danger)}
+.wa-tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}
+.wa-tools__hint{color:var(--text-muted);font-size:var(--fs-12)}
+.wa-samples{display:grid;gap:8px;padding:12px;border-radius:var(--radius-md);background:var(--surface-sunken)}
+.wa-sample{display:grid;grid-template-columns:96px minmax(0,1fr);gap:8px;align-items:center}
+.wa-sample code{padding:7px 8px;border-radius:var(--radius-control,6px);background:var(--surface-card);border:1px solid var(--border-subtle);color:var(--text-muted);font-size:var(--fs-12);text-align:center}
+.wa-samples__none{margin:0;color:var(--text-muted);font-size:var(--fs-13)}
+.wa-pair{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:0 20px}
+@media (max-width:640px){.wa-pair{grid-template-columns:minmax(0,1fr)}}
+.wa-vars td:first-child{width:1%;white-space:nowrap}

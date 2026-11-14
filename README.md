@@ -39,7 +39,9 @@ In the Meta app, under WhatsApp, Configuration, set the callback URL to `https:/
 
 ## Write a template
 
-Templates, New template: a name, a category, the message with `{{1}}`, `{{2}}` where values go, and a sample of each value. Preview shows the message as a recipient reads it; Submit to Meta for review sends it, and the list shows it in review until Meta decides. Delete at Meta removes one language of a template.
+Templates lists each template with its category, its review status and, for the last 30 days, how many messages were sent, delivered, read, failed and charged. A template's page shows it as a phone does, with the sample values or as written, the values it takes and its latest messages.
+
+Templates, New template: a name, a category, the message with `{{1}}`, `{{2}}` where values go, and a sample of each value. The preview beside the form follows what is typed. Check names anything Meta's rules refuse; Submit to Meta for review then sends it, and the list shows it in review until Meta decides. Delete at Meta removes one language of a template.
 
 ## Send a message
 

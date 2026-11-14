@@ -303,23 +303,133 @@ pub async fn log(
     let rows = bind_values(sqlx::query(&sql), values)
         .fetch_all(&db.pool)
         .await?;
-    let mut out = Vec::with_capacity(rows.len());
+    rows.iter().map(sent_from).collect()
+}
+
+/// What became of the messages sent with one template.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// Messages Meta accepted, whatever became of them after.
+    pub sent: i64,
+    /// Messages that reached the phone.
+    pub delivered: i64,
+    /// Messages the recipient opened.
+    pub read: i64,
+    /// Messages that failed.
+    pub failed: i64,
+    /// Messages still waiting to be sent.
+    pub waiting: i64,
+    /// Messages Meta charged for.
+    pub charged: i64,
+}
+
+/// The tally of each template's messages queued since `from` (`YYYY-MM-DD`),
+/// by template name and language.
+pub async fn tallies(
+    db: &Db,
+    from: &str,
+) -> Result<std::collections::HashMap<(String, String), Tally>, WhatsAppError> {
+    let count = sea_query::Alias::new("n");
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .columns([
+                Messages::Template,
+                Messages::Language,
+                Messages::State,
+                Messages::Billable,
+            ])
+            .expr_as(Expr::col(Messages::Id).count(), count)
+            .from(Messages::Table)
+            .and_where(Expr::col(Messages::CreatedAt).gte(from))
+            .group_by_columns([
+                Messages::Template,
+                Messages::Language,
+                Messages::State,
+                Messages::Billable,
+            ])
+            .to_owned(),
+    );
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    let mut out: std::collections::HashMap<(String, String), Tally> = Default::default();
     for row in &rows {
-        out.push(Sent {
-            id: sqlx::Row::try_get::<i64, _>(row, "id")?,
-            to: row.get_text("to_number")?,
-            template: row.get_text("template")?,
-            category: row.get_text("category")?,
-            state: row.get_text("state")?,
-            error: row.get_text_opt("error_text")?.filter(|e| !e.is_empty()),
-            billable: sqlx::Row::try_get::<Option<i32>, _>(row, "billable")
-                .ok()
-                .flatten()
-                .map(|b| b != 0),
-            created_at: row.get_text("created_at")?,
-        });
+        let n = row.get_int("n")?;
+        let tally = out
+            .entry((row.get_text("template")?, row.get_text("language")?))
+            .or_default();
+        match row.get_text("state")?.as_str() {
+            "queued" => tally.waiting += n,
+            "failed" => tally.failed += n,
+            "read" => {
+                tally.sent += n;
+                tally.delivered += n;
+                tally.read += n;
+            }
+            "delivered" => {
+                tally.sent += n;
+                tally.delivered += n;
+            }
+            _ => tally.sent += n,
+        }
+        let billable = sqlx::Row::try_get::<Option<i32>, _>(row, "billable")
+            .ok()
+            .flatten();
+        if billable.is_some_and(|b| b != 0) {
+            tally.charged += n;
+        }
     }
     Ok(out)
+}
+
+/// The newest messages sent with one template, at most `limit`.
+pub async fn recent(
+    db: &Db,
+    template: &str,
+    language: &str,
+    limit: u64,
+) -> Result<Vec<Sent>, WhatsAppError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .columns([
+                Messages::Id,
+                Messages::ToNumber,
+                Messages::Template,
+                Messages::Category,
+                Messages::State,
+                Messages::ErrorText,
+                Messages::Billable,
+                Messages::CreatedAt,
+            ])
+            .from(Messages::Table)
+            .and_where(Expr::col(Messages::Template).eq(template))
+            .and_where(Expr::col(Messages::Language).eq(language))
+            .order_by(Messages::Id, sea_query::Order::Desc)
+            .limit(limit)
+            .to_owned(),
+    );
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    rows.iter().map(sent_from).collect()
+}
+
+fn sent_from(row: &sqlx::any::AnyRow) -> Result<Sent, WhatsAppError> {
+    Ok(Sent {
+        id: sqlx::Row::try_get::<i64, _>(row, "id")?,
+        to: row.get_text("to_number")?,
+        template: row.get_text("template")?,
+        category: row.get_text("category")?,
+        state: row.get_text("state")?,
+        error: row.get_text_opt("error_text")?.filter(|e| !e.is_empty()),
+        billable: sqlx::Row::try_get::<Option<i32>, _>(row, "billable")
+            .ok()
+            .flatten()
+            .map(|b| b != 0),
+        created_at: row.get_text("created_at")?,
+    })
 }
 
 /// Sends one queued message.

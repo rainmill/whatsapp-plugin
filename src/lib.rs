@@ -16,6 +16,7 @@ pub mod messages;
 pub mod migrations;
 mod schema;
 pub mod templates;
+mod view;
 pub mod webhook;
 
 use laterite_admin::form::FormField;

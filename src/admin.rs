@@ -23,7 +23,7 @@ use laterite_core::{t, Registry, Text};
 
 use crate::messages::{self, Sent};
 use crate::templates::{self, Draft, Template};
-use crate::{WhatsAppError, MESSAGES, TEMPLATES};
+use crate::{view, WhatsAppError, MESSAGES, TEMPLATES};
 
 const SECTION: &str = "rainmill.whatsapp";
 
@@ -37,6 +37,8 @@ pub(crate) fn register(registry: &mut Registry) {
         Permission::new(MESSAGES, t!("Read the message log"), group())
             .roles([laterite_admin::ROLE_ADMIN]),
     );
+    registry.add_asset(view::CSS, view::css());
+    registry.add_asset(view::JS, view::js());
     registry.add_nav(
         laterite_admin::nav::NavItem::section(SECTION, t!("WhatsApp"))
             .icon("send")
@@ -67,12 +69,7 @@ pub(crate) fn register(registry: &mut Registry) {
     );
 }
 
-pub(crate) fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
+pub(crate) use crate::view::{category_text, escape};
 
 pub(crate) fn failure(e: WhatsAppError) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -92,27 +89,25 @@ fn status_text(status: &str) -> Text {
     }
 }
 
-/// A category as an administrator reads it.
-pub(crate) fn category_text(category: &str) -> Text {
-    match category.to_ascii_uppercase().as_str() {
-        "MARKETING" => t!("Marketing"),
-        "UTILITY" => t!("Utility"),
-        "AUTHENTICATION" => t!("Authentication"),
-        "SERVICE" => t!("Service"),
-        other => Text::dynamic(other.to_string()),
+fn status_tone(status: &str) -> &'static str {
+    match status {
+        "APPROVED" => "ok",
+        "PENDING" | "IN_APPEAL" | "DRAFT" => "wait",
+        _ => "bad",
     }
 }
 
 fn status_badge(shell: &Shell, status: &str) -> String {
-    let tone = match status {
-        "APPROVED" => "ok",
-        "PENDING" | "IN_APPEAL" => "wait",
-        _ => "bad",
-    };
-    format!(
-        r#"<span class="lat-badge" data-tone="{tone}">{}</span>"#,
-        escape(&shell.tt(&status_text(status)))
-    )
+    view::pill(status_tone(status), &shell.tt(&status_text(status)))
+}
+
+/// How far back the Templates screens count messages, in days.
+const COUNT_DAYS: i64 = 30;
+
+fn count_from() -> String {
+    (Utc::now() - chrono::Duration::days(COUNT_DAYS))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 struct Templates;
@@ -151,10 +146,13 @@ impl Screen for Templates {
             )
             .route(
                 "/",
-                get(move |Extension(shell): Extension<Shell>| {
-                    let ctx = index_cx.clone();
-                    async move { index(&ctx, shell).await }
-                }),
+                get(
+                    move |Extension(shell): Extension<Shell>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let ctx = index_cx.clone();
+                        async move { index(&ctx, shell, query).await }
+                    },
+                ),
             )
             .route(
                 "/sync",
@@ -169,22 +167,44 @@ impl Screen for Templates {
             .route(
                 "/{id}",
                 get(
-                    move |Path(id): Path<i64>, Extension(shell): Extension<Shell>| {
+                    move |Path(id): Path<i64>,
+                          Extension(shell): Extension<Shell>,
+                          Query(query): Query<HashMap<String, String>>| {
                         let ctx = show_cx.clone();
-                        async move { show(&ctx, shell, id).await }
+                        let written = query.get("as").is_some_and(|v| v == "written");
+                        async move { show(&ctx, shell, id, written).await }
                     },
                 ),
             )
     }
 }
 
-async fn index(ctx: &RouteCtx, shell: Shell) -> Response {
-    let list = match templates::list(ctx.db()).await {
+async fn index(ctx: &RouteCtx, shell: Shell, query: HashMap<String, String>) -> Response {
+    let all = match templates::list(ctx.db()).await {
         Ok(list) => list,
         Err(e) => return failure(e),
     };
+    let tallies = messages::tallies(ctx.db(), &count_from())
+        .await
+        .unwrap_or_default();
+    let asked = |key: &str| query.get(key).map(|v| v.trim()).unwrap_or_default();
+    let (q, category, status) = (
+        asked("q").to_lowercase(),
+        asked("category").to_ascii_uppercase(),
+        asked("status").to_ascii_uppercase(),
+    );
+    let list: Vec<&Template> = all
+        .iter()
+        .filter(|t| {
+            (q.is_empty()
+                || t.name.to_lowercase().contains(&q)
+                || t.body_text().to_lowercase().contains(&q))
+                && (category.is_empty() || t.category.eq_ignore_ascii_case(&category))
+                && (status.is_empty() || t.status.eq_ignore_ascii_case(&status))
+        })
+        .collect();
     let mut body = String::new();
-    if list.is_empty() {
+    if all.is_empty() {
         body.push_str(&format!(
             r#"<p class="lat-note">{}</p>"#,
             escape(&shell.t(
@@ -192,34 +212,102 @@ async fn index(ctx: &RouteCtx, shell: Shell) -> Response {
             ))
         ));
     } else {
+        let options = |chosen: &str, all_label: &str, values: &[(&str, Text)]| {
+            let mut out = format!(
+                r#"<option value="">{}</option>"#,
+                escape(&shell.t(all_label))
+            );
+            for (value, label) in values {
+                out.push_str(&format!(
+                    r#"<option value="{value}"{}>{}</option>"#,
+                    if chosen == *value { " selected" } else { "" },
+                    escape(&shell.tt(label))
+                ));
+            }
+            out
+        };
+        body.push_str(&format!(
+            r#"<form class="wa-filters" method="get" role="search"><input class="lat-input" type="search" name="q" value="{q}" placeholder="{search}" aria-label="{search}"><select class="lat-input" name="category" aria-label="{category_label}">{categories}</select><select class="lat-input" name="status" aria-label="{status_label}">{statuses}</select><button class="lat-btn lat-btn--secondary" type="submit">{apply}</button></form>"#,
+            q = escape(asked("q")),
+            search = escape(&shell.t("Search by name or wording")),
+            category_label = escape(&shell.t("Category")),
+            categories = options(
+                &category,
+                "Every category",
+                &["MARKETING", "UTILITY", "AUTHENTICATION"].map(|c| (c, category_text(c))),
+            ),
+            status_label = escape(&shell.t("Status")),
+            statuses = options(
+                &status,
+                "Every status",
+                &["APPROVED", "PENDING", "REJECTED", "PAUSED", "DISABLED"]
+                    .map(|s| (s, status_text(s))),
+            ),
+            apply = escape(&shell.t("Filter")),
+        ));
         let mut rows = String::new();
         for template in &list {
+            let tally = tallies
+                .get(&(template.name.clone(), template.language.clone()))
+                .copied()
+                .unwrap_or_default();
+            let number = |n: i64| {
+                if n == 0 {
+                    r#"<span class="lat-muted">0</span>"#.to_string()
+                } else {
+                    n.to_string()
+                }
+            };
             rows.push_str(&format!(
-                r#"<tr><td><a href="{href}"><strong>{name}</strong></a></td><td>{language}</td><td>{category}</td><td>{status}{reason}</td><td>{synced}</td></tr>"#,
+                r#"<tr><td><div class="wa-name">{tile}<div><a href="{href}">{name}</a><span class="wa-snippet">{snippet}</span></div></div></td><td>{category}<span class="wa-sub">{language}</span></td><td>{status}{reason}</td><td class="wa-num">{sent}</td><td class="wa-num">{delivered}</td><td class="wa-num">{read}</td><td class="wa-num">{failed}</td><td class="wa-num">{charged}</td></tr>"#,
+                tile = view::tile(&shell, &template.category, true),
                 href = escape(&ctx.url(&template.id.to_string())),
                 name = escape(&template.name),
-                language = escape(&template.language),
+                snippet = escape(&template.body_text().replace('\n', " ")),
                 category = escape(&shell.tt(&category_text(&template.category))),
+                language = escape(&template.language),
                 status = status_badge(&shell, &template.status),
                 reason = template
                     .rejected_reason
                     .as_ref()
-                    .map(|r| format!(
-                        r#"<br><span class="lat-muted">{}</span>"#,
-                        escape(r)
-                    ))
+                    .map(|r| format!(r#"<span class="wa-sub">{}</span>"#, escape(r)))
                     .unwrap_or_default(),
-                synced = escape(&shell.datetime(&template.synced_at)),
+                sent = number(tally.sent),
+                delivered = number(tally.delivered),
+                read = number(tally.read),
+                failed = number(tally.failed),
+                charged = number(tally.charged),
             ));
         }
-        body.push_str(&format!(
-            r#"<div class="lat-tablewrap"><table class="lat-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
-            escape(&shell.t("Template")),
-            escape(&shell.t("Language")),
-            escape(&shell.t("Category")),
-            escape(&shell.t("Status")),
-            escape(&shell.t("Last read from Meta")),
-        ));
+        if rows.is_empty() {
+            body.push_str(&format!(
+                r#"<p class="lat-note">{}</p>"#,
+                escape(&shell.t("No template matches."))
+            ));
+        } else {
+            let head = |label: &str, numeric: bool| {
+                format!(
+                    r#"<th{}>{}</th>"#,
+                    if numeric { r#" class="wa-num""# } else { "" },
+                    escape(&shell.t(label))
+                )
+            };
+            body.push_str(&format!(
+                r#"<div class="lat-tablewrap"><table class="lat-table wa-list"><thead><tr>{}{}{}{}{}{}{}{}</tr></thead><tbody>{rows}</tbody></table></div><p class="lat-note">{}</p>"#,
+                head("Template", false),
+                head("Category", false),
+                head("Status", false),
+                head("Sent", true),
+                head("Delivered", true),
+                head("Read", true),
+                head("Failed", true),
+                head("Charged", true),
+                escape(&shell.tf(
+                    "The counts are of messages queued in the last {n} days.",
+                    &[("n", COUNT_DAYS)]
+                )),
+            ));
+        }
     }
     let mut actions = Button::link(t!("New template"), ctx.url("new"))
         .primary()
@@ -230,7 +318,9 @@ async fn index(ctx: &RouteCtx, shell: Shell) -> Response {
             .render(&shell),
     );
     shell.page_with(
-        PageHead::new(t!("Message templates")).actions(actions),
+        PageHead::new(t!("Message templates"))
+            .actions(actions)
+            .assets(&[view::CSS]),
         Markup::raw_unchecked(body),
     )
 }
@@ -262,90 +352,169 @@ async fn sync(ctx: &RouteCtx, user: AuthenticatedUser, session: SessionHandle) -
     Redirect::to(&ctx.url("")).into_response()
 }
 
-/// The message as it looks on a phone.
-pub(crate) fn bubble(preview: &crate::Preview) -> String {
-    let mut inner = String::new();
-    if let Some(header) = &preview.header {
-        inner.push_str(&format!(
-            r#"<div style="font-weight:600;margin-bottom:6px">{}</div>"#,
-            escape(header)
-        ));
-    }
-    inner.push_str(&format!(
-        r#"<div style="white-space:pre-wrap">{}</div>"#,
-        escape(&preview.body)
-    ));
-    if let Some(footer) = &preview.footer {
-        inner.push_str(&format!(
-            r#"<div style="margin-top:6px;font-size:12px;opacity:.6">{}</div>"#,
-            escape(footer)
-        ));
-    }
-    let mut buttons = String::new();
-    for (_, text, target) in &preview.buttons {
-        buttons.push_str(&format!(
-            r#"<div style="margin-top:4px;padding:9px 12px;border-radius:10px;background:#fff;color:#0a7cff;text-align:center;font-size:14px;box-shadow:0 1px 1px rgba(0,0,0,.12)" title="{}">{}</div>"#,
-            escape(target),
-            escape(text)
-        ));
-    }
-    format!(
-        r#"<div style="max-width:340px;padding:16px;border-radius:14px;background:#e6ddd4"><div style="padding:10px 12px;border-radius:10px;background:#fff;color:#111;font-size:14px;line-height:1.45;box-shadow:0 1px 1px rgba(0,0,0,.12)">{inner}</div>{buttons}</div>"#
-    )
-}
-
-async fn show(ctx: &RouteCtx, shell: Shell, id: i64) -> Response {
+async fn show(ctx: &RouteCtx, shell: Shell, id: i64, written: bool) -> Response {
     let template: Template = match templates::find(ctx.db(), id).await {
         Ok(Some(template)) => template,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return failure(e),
     };
-    let preview = template.preview(&[], None);
-    let fact = |label: &str, value: String| {
+    let preview = if written {
+        template.outline()
+    } else {
+        template.preview(&[], None)
+    };
+    let tally = messages::tallies(ctx.db(), &count_from())
+        .await
+        .unwrap_or_default()
+        .get(&(template.name.clone(), template.language.clone()))
+        .copied()
+        .unwrap_or_default();
+    let recent = messages::recent(ctx.db(), &template.name, &template.language, 10)
+        .await
+        .unwrap_or_default();
+    let sep = r#"<span class="wa-meta__sep">·</span>"#;
+    let head = format!(
+        r#"<div class="wa-head">{tile}<div><h2 class="wa-head__name">{name} <span class="lat-muted">· {language}</span></h2><div class="wa-meta">{status}{sep}<span title="{cost}">{category}</span>{sep}<span>{read_label} {synced}</span>{meta_id}</div></div></div>"#,
+        tile = view::tile(&shell, &template.category, false),
+        name = escape(&template.name),
+        language = escape(&template.language),
+        status = status_badge(&shell, &template.status),
+        cost = escape(&shell.tt(&view::category_cost(&template.category))),
+        category = escape(&shell.tt(&category_text(&template.category))),
+        read_label = escape(&shell.t("Read from Meta")),
+        synced = escape(&shell.datetime(&template.synced_at)),
+        meta_id = if template.wa_id.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"{sep}<span>{} <code>{}</code></span>"#,
+                escape(&shell.t("Meta ID")),
+                escape(&template.wa_id)
+            )
+        },
+    );
+    let reason = template
+        .rejected_reason
+        .as_ref()
+        .map(|r| {
+            format!(
+                r#"<div class="lat-alert"><strong>{}</strong> {}</div>"#,
+                escape(&shell.t("Meta's reason:")),
+                escape(r)
+            )
+        })
+        .unwrap_or_default();
+    let here = ctx.url(&id.to_string());
+    let side = format!(
+        r#"<div class="lat-card"><div class="wa-preview__head"><h2 class="lat-section-title">{title}</h2><span class="wa-toggle"><a href="{here}"{on_sample}>{sample}</a><a href="{here}?as=written"{on_written}>{as_written}</a></span></div>{phone}</div>"#,
+        title = escape(&shell.t("Your template")),
+        here = escape(&here),
+        on_sample = if written { "" } else { r#" class="is-on""# },
+        on_written = if written { r#" class="is-on""# } else { "" },
+        sample = escape(&shell.t("With samples")),
+        as_written = escape(&shell.t("As written")),
+        phone = view::phone(&shell, &preview),
+    );
+    let stat = |label: &str, value: i64| {
         format!(
-            r#"<div class="lat-stat"><span>{}</span><b style="font-size:var(--fs-16)">{value}</b></div>"#,
+            r#"<div class="lat-stat"><span>{}</span><b style="font-size:var(--fs-20)">{value}</b></div>"#,
             escape(&shell.t(label))
         )
     };
-    let mut links = String::new();
-    for (kind, text, target) in &preview.buttons {
-        if !target.is_empty() {
-            links.push_str(&format!(
-                "<li>{} ({}): <code>{}</code></li>",
-                escape(text),
-                escape(&kind.to_lowercase().replace('_', " ")),
-                escape(target)
+    let mut main = format!(
+        r#"<div class="lat-card"><h2 class="lat-section-title">{title}</h2><p class="lat-note">{note}</p><div class="lat-stats wa-stats">{sent}{delivered}{read}{failed}{charged}</div><p class="lat-note" style="margin:0"><strong>{category}:</strong> {cost}.</p></div>"#,
+        title = escape(&shell.t("How it has done")),
+        note = escape(&shell.tf(
+            "Messages queued with this template in the last {n} days.",
+            &[("n", COUNT_DAYS)]
+        )),
+        sent = stat("Sent", tally.sent),
+        delivered = stat("Delivered", tally.delivered),
+        read = stat("Read", tally.read),
+        failed = stat("Failed", tally.failed),
+        charged = stat("Charged", tally.charged),
+        category = escape(&shell.tt(&category_text(&template.category))),
+        cost = escape(&shell.tt(&view::category_cost(&template.category))),
+    );
+    let samples = template.body_samples();
+    let takes = template.body_params();
+    if takes > 0 {
+        let mut rows = String::new();
+        for n in 1..=takes {
+            rows.push_str(&format!(
+                r#"<tr><td><span class="wa-var">{{{{{n}}}}}</span></td><td>{}</td></tr>"#,
+                samples
+                    .get(n - 1)
+                    .map(|s| escape(s))
+                    .unwrap_or_else(|| r#"<span class="lat-muted">-</span>"#.to_string())
             ));
         }
+        main.push_str(&format!(
+            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2><p class="lat-note">{}</p><div class="lat-tablewrap"><table class="lat-table wa-vars"><thead><tr><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div></div>"#,
+            escape(&shell.t("Values it takes")),
+            escape(&shell.t(
+                "Each is filled in when a message is sent. Meta reviewed the template with the sample beside it."
+            )),
+            escape(&shell.t("Value")),
+            escape(&shell.t("Sample")),
+        ));
+    }
+    let buttons: Vec<_> = template.outline().buttons;
+    if !buttons.is_empty() {
+        let mut rows = String::new();
+        for (kind, text, target) in &buttons {
+            let kind = match kind.as_str() {
+                "URL" => shell.t("Opens an address"),
+                "PHONE_NUMBER" => shell.t("Calls a number"),
+                "COPY_CODE" => shell.t("Copies a code"),
+                _ => shell.t("Quick reply"),
+            };
+            rows.push_str(&format!(
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                escape(text),
+                escape(&kind),
+                if target.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<code style="overflow-wrap:anywhere">{}</code>"#,
+                        escape(target)
+                    )
+                }
+            ));
+        }
+        main.push_str(&format!(
+            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2><div class="lat-tablewrap"><table class="lat-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div></div>"#,
+            escape(&shell.t("Buttons")),
+            escape(&shell.t("Label")),
+            escape(&shell.t("What it does")),
+            escape(&shell.t("Where it goes")),
+        ));
+    }
+    if !recent.is_empty() {
+        let mut rows = String::new();
+        for m in &recent {
+            rows.push_str(&format!(
+                r#"<tr><td>{}</td><td>{}</td><td>{}{}</td></tr>"#,
+                escape(&shell.datetime(&m.created_at)),
+                escape(&m.to),
+                state_badge(&shell, &m.state),
+                m.error
+                    .as_ref()
+                    .map(|e| format!(r#"<span class="wa-error">{}</span>"#, escape(e)))
+                    .unwrap_or_default(),
+            ));
+        }
+        main.push_str(&format!(
+            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2><div class="lat-tablewrap"><table class="lat-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div></div>"#,
+            escape(&shell.t("Latest messages")),
+            escape(&shell.t("Queued")),
+            escape(&shell.t("To")),
+            escape(&shell.t("State")),
+        ));
     }
     let body = format!(
-        r#"<div class="lat-stats">{language}{category}{status}{params}</div><div class="lat-card"><h2 class="lat-section-title">{sample_title}</h2><p class="lat-note">{sample_note}</p>{bubble}{links}</div>{reason}"#,
-        language = fact("Language", escape(&template.language)),
-        category = fact(
-            "Category",
-            escape(&shell.tt(&category_text(&template.category)))
-        ),
-        status = fact("Status", status_badge(&shell, &template.status)),
-        params = fact("Values it takes", template.body_params().to_string()),
-        sample_title = escape(&shell.t("Sample")),
-        sample_note = escape(&shell.t(
-            "The message as a recipient reads it, filled with the sample values given to Meta."
-        )),
-        bubble = bubble(&preview),
-        links = if links.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<ul class="lat-note">{links}</ul>"#)
-        },
-        reason = template
-            .rejected_reason
-            .as_ref()
-            .map(|r| format!(
-                r#"<p class="lat-note">{}: {}</p>"#,
-                escape(&shell.t("Meta's reason")),
-                escape(r)
-            ))
-            .unwrap_or_default(),
+        r#"{head}{reason}<div class="wa-split"><div class="wa-split__main">{main}</div><div class="wa-split__side">{side}</div></div>"#
     );
     let remove = Button::post(t!("Delete at Meta"), ctx.url(&format!("{id}/delete")))
         .danger()
@@ -357,9 +526,22 @@ async fn show(ctx: &RouteCtx, shell: Shell, id: i64) -> Response {
         PageHead::new(Text::dynamic(template.name.clone()))
             .back(t!("Message templates"), ctx.url(""))
             .actions(remove)
-            .assets(CHART_ASSETS),
+            .assets(CHART_ASSETS)
+            .assets(&[view::CSS]),
         Markup::raw_unchecked(body),
     )
+}
+
+fn state_tone(state: &str) -> &'static str {
+    match state {
+        "failed" => "bad",
+        "queued" => "wait",
+        _ => "ok",
+    }
+}
+
+fn state_badge(shell: &Shell, state: &str) -> String {
+    view::pill(state_tone(state), &shell.tt(&state_text(state)))
 }
 
 /// A message's state as an administrator reads it.
@@ -560,22 +742,17 @@ async fn log(ctx: &RouteCtx, shell: Shell, query: ChartQuery, state: Option<Stri
         .filter(|m| state.as_deref().is_none_or(|s| m.state == s))
         .take(TABLE_ROWS)
     {
-        let tone = match m.state.as_str() {
-            "failed" => "bad",
-            "queued" => "wait",
-            _ => "ok",
-        };
         rows.push_str(&format!(
-            r#"<tr><td>{when}</td><td>{to}</td><td>{template}</td><td>{category}</td><td><span class="lat-badge" data-tone="{tone}">{state}</span>{error}</td></tr>"#,
+            r#"<tr><td>{when}</td><td>{to}</td><td>{template}</td><td>{category}</td><td>{state}{error}</td></tr>"#,
             when = escape(&shell.datetime(&m.created_at)),
             to = escape(&m.to),
             template = escape(&m.template),
             category = escape(&shell.tt(&category_text(&m.category))),
-            state = escape(&shell.tt(&state_text(&m.state))),
+            state = state_badge(&shell, &m.state),
             error = m
                 .error
                 .as_ref()
-                .map(|e| format!(r#"<br><span class="lat-muted">{}</span>"#, escape(e)))
+                .map(|e| format!(r#"<span class="wa-error">{}</span>"#, escape(e)))
                 .unwrap_or_default(),
         ));
     }
@@ -598,7 +775,9 @@ async fn log(ctx: &RouteCtx, shell: Shell, query: ChartQuery, state: Option<Stri
         r#"<div class="lat-period"><div class="lat-period__presets">{filters}</div></div>{table}"#
     ));
     shell.page_with(
-        PageHead::new(t!("WhatsApp messages")).assets(CHART_ASSETS),
+        PageHead::new(t!("WhatsApp messages"))
+            .assets(CHART_ASSETS)
+            .assets(&[view::CSS]),
         Markup::raw_unchecked(body),
     )
 }
@@ -610,6 +789,19 @@ fn draft_from(data: &HashMap<String, String>) -> Draft {
             .map(|v| v.trim().to_string())
             .unwrap_or_default()
     };
+    // One box a value, in order; a form posted without the script's boxes
+    // gives them one a line.
+    let mut samples: Vec<String> = (1..=99)
+        .map_while(|n| data.get(&format!("sample_{n}")))
+        .map(|v| v.trim().to_string())
+        .collect();
+    if samples.is_empty() {
+        samples = text("samples")
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+    }
     Draft {
         name: text("name"),
         category: text("category"),
@@ -620,33 +812,29 @@ fn draft_from(data: &HashMap<String, String>) -> Draft {
             .cloned()
             .unwrap_or_default()
             .replace("\r\n", "\n"),
-        samples: text("samples")
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect(),
+        samples,
         footer: text("footer"),
         button_text: text("button_text"),
         button_url: text("button_url"),
     }
 }
 
-/// The New template form. Once a draft has been previewed with nothing wrong,
-/// the page shows it as a recipient would read it and offers to submit it.
+/// The New template form beside the message as a phone shows it. Once a
+/// draft has been checked with nothing wrong, the page offers to submit it.
 fn draft_page(
     ctx: &RouteCtx,
     shell: Shell,
     draft: &Draft,
-    previewed: bool,
+    checked: bool,
     error: Option<String>,
 ) -> Response {
-    let problems = if previewed {
+    let problems = if checked {
         draft.problems()
     } else {
         Vec::new()
     };
-    let field = |name: &'static str, label: &str, control: String, help: &str| {
-        let wrong: String = problems
+    let wrong = |name: &str| -> String {
+        problems
             .iter()
             .filter(|(field, _)| *field == name)
             .map(|(_, what)| {
@@ -655,7 +843,20 @@ fn draft_page(
                     escape(&shell.t(what))
                 )
             })
-            .collect();
+            .collect()
+    };
+    // A field: its label, a count when it has a limit, the control, the help
+    // and what is wrong with it.
+    let field = |name: &'static str,
+                 label: &str,
+                 limit: Option<u16>,
+                 control: String,
+                 help: &str| {
+        let count = limit
+            .map(|max| {
+                format!(r#"<span class="wa-count" data-wa-count="{name}" data-max="{max}"></span>"#)
+            })
+            .unwrap_or_default();
         let help = if help.is_empty() {
             String::new()
         } else {
@@ -665,8 +866,9 @@ fn draft_page(
             )
         };
         format!(
-            r#"<div class="lat-field"><label class="lat-label" for="{name}">{}</label>{control}{help}{wrong}</div>"#,
-            escape(&shell.t(label))
+            r#"<div class="lat-field">{count}<label class="lat-label" for="{name}">{}</label>{control}{help}{}</div>"#,
+            escape(&shell.t(label)),
+            wrong(name)
         )
     };
     let input = |name: &str, value: &str, extra: &str| {
@@ -675,82 +877,162 @@ fn draft_page(
             escape(value)
         )
     };
-    let area = |name: &str, value: &str, rows: u8| {
+    let options: String = ["UTILITY", "MARKETING", "AUTHENTICATION"]
+        .iter()
+        .map(|value| {
+            format!(
+                r#"<option value="{value}"{}>{}: {}</option>"#,
+                if draft.category.eq_ignore_ascii_case(value) {
+                    " selected"
+                } else {
+                    ""
+                },
+                escape(&shell.tt(&category_text(value))),
+                escape(&shell.tt(&view::category_cost(value)).to_lowercase()),
+            )
+        })
+        .collect();
+    let section = |title: &str, note: &str, inner: String| {
         format!(
-            r#"<textarea class="lat-input" id="{name}" name="{name}" rows="{rows}">{}</textarea>"#,
-            escape(value)
+            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2>{}{inner}</div>"#,
+            escape(&shell.t(title)),
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<p class="lat-note">{}</p>"#, escape(&shell.t(note)))
+            }
         )
     };
-    let options: String = [
-        ("UTILITY", "Utility: about something the person did"),
-        ("MARKETING", "Marketing: offers and announcements"),
-        ("AUTHENTICATION", "Authentication: one-time codes"),
-    ]
-    .iter()
-    .map(|(value, label)| {
+    let takes = draft.as_template().body_params().max(draft.samples.len());
+    let mut sample_rows = String::new();
+    for n in 1..=takes {
+        sample_rows.push_str(&format!(
+            r#"<div class="wa-sample" data-wa-sample><code>{{{{{n}}}}}</code><input class="lat-input" name="sample_{n}" value="{}" maxlength="200" autocomplete="off" aria-label="{}"></div>"#,
+            escape(draft.samples.get(n - 1).map(String::as_str).unwrap_or_default()),
+            escape(&shell.tfs("A sample of {n}", &[("n", &format!("{{{{{n}}}}}"))])),
+        ));
+    }
+    let samples = format!(
+        r#"<div class="lat-field"><span class="lat-label">{label}</span><div class="wa-samples" data-wa-samples data-label="{aria}"><p class="wa-samples__none" data-wa-none{hidden}>{none}</p>{sample_rows}</div><p class="lat-field__help">{help}</p>{wrong}</div>"#,
+        label = escape(&shell.t("Sample values")),
+        aria = escape(&shell.t("A sample of {n}")),
+        hidden = if takes > 0 { " hidden" } else { "" },
+        none = escape(&shell.t("The message takes no values yet. Write {{1}} where one goes, or press Add a value.")),
+        help = escape(&shell.t(
+            "A realistic example of each value. Meta reviews the message with these; they are never sent. Use no real person's details."
+        )),
+        wrong = wrong("samples"),
+    );
+    let naming = section(
+        "Name, language and category",
+        "",
         format!(
-            r#"<option value="{value}"{}>{}</option>"#,
-            if draft.category.eq_ignore_ascii_case(value) {
-                " selected"
-            } else {
+            r#"<div class="wa-pair">{}{}</div>{}"#,
+            field(
+                "name",
+                "Name",
+                Some(512),
+                input("name", &draft.name, r#"maxlength="512" autocapitalize="off" spellcheck="false""#),
+                "Lowercase letters, digits and underscores. It cannot be changed, and a deleted name is held for 30 days."
+            ),
+            field(
+                "language",
+                "Language",
+                None,
+                input(
+                    "language",
+                    if draft.language.is_empty() { "en" } else { &draft.language },
+                    r#"maxlength="12""#
+                ),
+                "A code such as en or en_US."
+            ),
+            field(
+                "category",
+                "Category",
+                None,
+                format!(r#"<select class="lat-input" id="category" name="category">{options}</select>"#),
+                "The category sets what Meta charges, and Meta may move a template it thinks is in the wrong one."
+            ),
+        ),
+    );
+    let content = section(
+        "Content",
+        "A header, the message and a footer. Meta reviews the wording and the values before the template can be sent.",
+        format!(
+            "{}{}{samples}{}",
+            field(
+                "header",
+                "Header",
+                Some(60),
+                input("header", &draft.header, r#"maxlength="60""#),
+                "Optional. One line above the message, in bold."
+            ),
+            field(
+                "body",
+                "Message",
+                Some(1024),
+                format!(
+                    r#"<textarea class="lat-input" id="body" name="body" rows="7">{}</textarea><div class="wa-tools"><button type="button" class="lat-btn lat-btn--secondary lat-btn--sm" data-wa-add-value>{}</button><span class="wa-tools__hint">{}</span></div>"#,
+                    escape(&draft.body),
+                    escape(&shell.t("Add a value")),
+                    escape(&shell.t("*bold*  _italic_  ~struck~")),
+                ),
+                "Write {{1}}, {{2}} where a value goes. Anything that varies (a name, a date, a city) is a value, never typed in."
+            ),
+            field(
+                "footer",
+                "Footer",
+                Some(60),
+                input("footer", &draft.footer, r#"maxlength="60""#),
+                "Optional. One small line under the message."
+            ),
+        ),
+    );
+    let button = section(
+        "Button",
+        "Optional. One button under the message.",
+        format!(
+            r#"<div class="wa-pair">{}{}</div>"#,
+            field(
+                "button_url",
+                "Address it opens",
+                None,
+                input(
+                    "button_url",
+                    &draft.button_url,
+                    r#"inputmode="url" placeholder="https://""#
+                ),
+                "An https address. With none, the button is a quick reply."
+            ),
+            field(
+                "button_text",
+                "Label",
+                Some(25),
+                input("button_text", &draft.button_text, r#"maxlength="25""#),
                 ""
-            },
-            escape(&shell.t(label))
-        )
-    })
-    .collect();
-    let ready = previewed && problems.is_empty();
-    let mut body = String::new();
+            ),
+        ),
+    );
+    let ready = checked && problems.is_empty();
+    let mut main = String::new();
     if let Some(error) = error {
-        body.push_str(&format!(
+        main.push_str(&format!(
             r#"<div class="lat-alert">{}</div>"#,
             escape(&error)
         ));
     }
-    body.push_str(&format!(
-        r#"<form class="lat-card" method="post" action="{action}"><input type="hidden" name="_csrf" value="{csrf}"><div class="lat-fields">{name}{category}{language}{header}{text}{samples}{footer}{button_text}{button_url}</div><div class="lat-form-actions" style="display:flex;gap:8px"><button class="lat-btn{quiet}" type="submit" name="step" value="preview">{preview}</button>{submit}</div></form>"#,
-        action = escape(&ctx.url("new")),
-        csrf = escape(shell.csrf_token()),
-        name = field(
-            "name",
-            "Name",
-            input("name", &draft.name, r#"maxlength="512" autocapitalize="off" spellcheck="false""#),
-            "Lowercase letters, digits and underscores. It cannot be changed, and a deleted name is held for 30 days."
-        ),
-        category = field(
-            "category",
-            "Category",
-            format!(r#"<select class="lat-input" id="category" name="category">{options}</select>"#),
-            "Meta charges by category and may move a template it thinks is in the wrong one."
-        ),
-        language = field(
-            "language",
-            "Language",
-            input(
-                "language",
-                if draft.language.is_empty() { "en" } else { &draft.language },
-                r#"maxlength="12""#
-            ),
-            ""
-        ),
-        header = field("header", "Header", input("header", &draft.header, r#"maxlength="60""#), "Optional. One line above the message."),
-        text = field(
-            "body",
-            "Message",
-            area("body", &draft.body, 6),
-            "Write {{1}}, {{2}} where a value goes. Anything that varies (a name, a date, a city) is a value, never typed in."
-        ),
-        samples = field(
-            "samples",
-            "Sample values",
-            area("samples", &draft.samples.join("\n"), 3),
-            "One a line, in order: a realistic example of each value. Meta reviews the message with these."
-        ),
-        footer = field("footer", "Footer", input("footer", &draft.footer, r#"maxlength="60""#), "Optional. One line under the message."),
-        button_text = field("button_text", "Button label", input("button_text", &draft.button_text, r#"maxlength="25""#), "Optional. With no address below it is a quick reply."),
-        button_url = field("button_url", "Button address", input("button_url", &draft.button_url, r#"inputmode="url""#), "Optional. An https address the button opens."),
-        quiet = if ready { "" } else { " lat-btn--primary" },
-        preview = escape(&shell.t("Preview")),
+    if ready {
+        main.push_str(&format!(
+            r#"<p class="lat-note">{}</p>"#,
+            escape(&shell.t(
+                "Nothing is wrong with it. The preview shows what Meta will review, filled with your samples. Change anything and check again, or submit it."
+            ))
+        ));
+    }
+    main.push_str(&format!(
+        r#"{naming}{content}{button}<div class="lat-form-actions" style="display:flex;gap:8px"><button class="lat-btn{quiet}" type="submit" name="step" value="preview">{check}</button>{submit}</div>"#,
+        quiet = if ready { " lat-btn--secondary" } else { " lat-btn--primary" },
+        check = escape(&shell.t("Check")),
         submit = if ready {
             format!(
                 r#"<button class="lat-btn lat-btn--primary" type="submit" name="step" value="submit">{}</button>"#,
@@ -760,18 +1042,22 @@ fn draft_page(
             String::new()
         },
     ));
-    if ready {
-        body.push_str(&format!(
-            r#"<div class="lat-card"><h2 class="lat-section-title">{}</h2><p class="lat-note">{}</p>{}</div>"#,
-            escape(&shell.t("Sample")),
-            escape(&shell.t(
-                "This is what Meta will review, filled with your sample values. Change anything above and preview again, or submit it."
-            )),
-            bubble(&draft.as_template().preview(&[], None)),
-        ));
-    }
+    let side = format!(
+        r#"<div class="lat-card"><div class="wa-preview__head"><h2 class="lat-section-title">{}</h2></div><div class="wa-chat" data-wa-preview data-empty="{}" data-time="{}">{}</div></div>"#,
+        escape(&shell.t("Preview")),
+        escape(&shell.t("Your message appears here.")),
+        view::TIME,
+        view::bubble(&shell, &draft.as_template().preview(&[], None)),
+    );
+    let body = format!(
+        r#"<form method="post" action="{action}" data-wa-editor><input type="hidden" name="_csrf" value="{csrf}"><div class="wa-split"><div class="wa-split__main">{main}</div><div class="wa-split__side">{side}</div></div></form>"#,
+        action = escape(&ctx.url("new")),
+        csrf = escape(shell.csrf_token()),
+    );
     shell.page_with(
-        PageHead::new(t!("New template")).back(t!("Message templates"), ctx.url("")),
+        PageHead::new(t!("New template"))
+            .back(t!("Message templates"), ctx.url(""))
+            .assets(&[view::CSS, view::JS]),
         Markup::raw_unchecked(body),
     )
 }
